@@ -124,6 +124,17 @@ class TuiTests(unittest.TestCase):
         self.assertFalse(handle_key(self.desk, '\r'))
         self.assertIsNone(self.store.get(self.first['id'])['answer'])
 
+    def test_escape_exits_every_mode_without_saving(self):
+        for mode in (None, 'quit', 'help', 'links'):
+            with self.subTest(mode=mode):
+                self.desk.mode = mode
+                self.desk.draft().update(choice='minimal', memo='未保存のメモ')
+                with patch.object(self.store, 'answer') as answer, patch('cue_tui.webbrowser.open') as opened:
+                    self.assertFalse(handle_key(self.desk, '\x1b'))
+                    answer.assert_not_called()
+                    opened.assert_not_called()
+                self.assertIsNone(self.store.get(self.first['id'])['answer'])
+
     def test_terminal_controls_and_japanese_width(self):
         malicious = '日本語\x1b]52;c;hidden\x07\r\u009b\u202eabc'
         escaped = safe_text(malicious)
@@ -210,6 +221,53 @@ class TuiTests(unittest.TestCase):
             handle_key(self.desk, '\r')
             self.assertEqual(opened.call_count, 2)
         self.assertIsNone(self.store.get(self.first['id'])['answer'])
+
+    def test_pty_single_escape_closes_promptly_from_every_mode(self):
+        for mode, keys, expected in [(None, b'', 'Enter で選択'), ('quit', b'q', '未保存の候補'), ('help', b'?', 'Cue の操作'), ('links', b'o', '関連リンクを開く')]:
+            with self.subTest(mode=mode):
+                master, slave = os.openpty()
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
+                before = termios.tcgetattr(slave)
+                process = subprocess.Popen([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'tui'], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
+                output = bytearray()
+
+                def pump_until(condition, timeout=8):
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        if select.select([master], [], [], 0.02)[0]:
+                            try:
+                                output.extend(os.read(master, 65536))
+                            except OSError:
+                                break
+                        if condition():
+                            return
+                        if process.poll() is not None:
+                            break
+                    self.fail(f'Esc の端末操作が完了しませんでした: {bytes(output).decode(errors="replace")[-1000:]}')
+
+                try:
+                    pump_until(lambda: b'Cue' in output)
+                    os.write(master, b'\x1b')
+                    time.sleep(0.03)
+                    os.write(master, b'OB' + keys)
+                    pump_until(lambda: expected.encode() in output)
+                    started = time.monotonic()
+                    os.write(master, b'\x1b')
+                    pump_until(lambda: process.poll() is not None, 0.6)
+                    self.assertLess(time.monotonic() - started, 0.6)
+                    self.assertEqual(process.returncode, 0)
+                    after = termios.tcgetattr(slave)
+                    after[3] &= ~getattr(termios, 'PENDIN', 0)
+                    before[3] &= ~getattr(termios, 'PENDIN', 0)
+                    self.assertEqual(after, before)
+                    self.assertIsNone(self.store.get(self.first['id'])['answer'])
+                    self.assertIsNone(self.store.get(self.second['id'])['answer'])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    os.close(master)
+                    os.close(slave)
 
     def test_pty_arrows_editor_resize_and_terminal_restore(self):
         editor = Path(self.directory.name) / 'editor.py'

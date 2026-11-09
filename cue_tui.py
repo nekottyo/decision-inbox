@@ -356,23 +356,23 @@ def draw(screen, desk):
     message = desk.load_error or desk.notice
     put(rows - 4, 1, message, curses.A_BOLD)
     put(rows - 3, 1, '↑↓ 選択  Enter 確定  ←→ 案件  m メモ  PgUp/PgDn スクロール')
-    put(rows - 2, 1, 'Tab 待ち/済み  f 優先度  w Web  o 関連リンク  ? ヘルプ  q 終了')
+    put(rows - 2, 1, 'Esc 閉じる  Tab 待ち/済み  f 優先度  w Web  o 関連リンク  ? ヘルプ  q 終了確認')
     if desk.mode:
         screen.erase()
         if desk.mode == 'quit':
             put(1, 2, '未保存の候補・メモを破棄しますか？', curses.A_BOLD)
             for index, label in enumerate(('戻る', '破棄して閉じる')):
                 put(4 + index * 2, 2, label, curses.A_REVERSE if desk.menu_index == index else 0)
-            put(rows - 2, 2, '↑↓ / ←→で選択、Enter で決定、Esc で戻る')
+            put(rows - 2, 2, '↑↓ / ←→で選択、Enter で決定、Esc で閉じる')
         elif desk.mode == 'links':
             put(1, 2, '関連リンクを開く', curses.A_BOLD)
             visible = max(1, (rows - 5) // 2)
             first = max(0, desk.menu_index - visible + 1)
             for offset, (label, target) in enumerate(desk.links()[first:first + visible]):
                 put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
-            put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で戻る')
+            put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で閉じる')
         else:
-            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'q / Esc: 終了 (未保存入力があれば確認)', '', 'Enter / Esc / ? で戻る']
+            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
             for index, line in enumerate(help_lines):
                 put(index + 1, 2, line, curses.A_BOLD if index == 0 else 0)
     screen.noutrefresh()
@@ -381,10 +381,10 @@ def draw(screen, desk):
 
 
 def handle_key(desk, key, page_height=10, edit=edit_with_editor):
+    if key == '\x1b':
+        return False
     if desk.mode:
-        if key == '\x1b':
-            desk.mode = None
-        elif desk.mode == 'help':
+        if desk.mode == 'help':
             if key in ('\n', '\r', curses.KEY_ENTER, '?', 'q'):
                 desk.mode = None
         elif key in (curses.KEY_UP, curses.KEY_LEFT, 'k'):
@@ -398,7 +398,7 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
                 desk.open_url(desk.links()[desk.menu_index][1])
             desk.mode = None
         return True
-    if key in ('q', '\x1b'):
+    if key == 'q':
         if desk.dirty():
             desk.mode, desk.menu_index = 'quit', 0
         else:
@@ -450,6 +450,7 @@ def run(store, *, web_url=None):
     locale.setlocale(locale.LC_ALL, '')
 
     def interactive(screen):
+        curses.set_escdelay(100)
         try:
             curses.curs_set(0)
         except curses.error:
