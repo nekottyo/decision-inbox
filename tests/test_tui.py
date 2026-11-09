@@ -117,6 +117,67 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(self.desk.draft(), {'choice': 'minimal', 'memo': '入力中の日本語'})
         self.assertEqual(self.desk.scroll, 12)
 
+    def test_undo_returns_answer_to_pending_and_retains_its_draft(self):
+        self.store.answer(self.first['id'], {'choice': 'refactor', 'memo': '回答のメモ'})
+        self.desk.change_view()
+        self.assertTrue(self.desk.item['answer']['can_undo'])
+        handle_key(self.desk, 'u')
+        self.assertEqual(self.desk.view, 'pending')
+        self.assertEqual(self.desk.item['id'], self.first['id'])
+        self.assertIsNone(self.store.get(self.first['id'])['answer'])
+        self.assertEqual(self.desk.draft(), {'choice': 'refactor', 'memo': '回答のメモ'})
+        self.assertIn('取り消し', self.desk.notice)
+
+    def test_undo_race_preserves_display_and_claimed_answer(self):
+        self.store.answer(self.first['id'], {'choice': 'refactor', 'memo': '回答のメモ'})
+        self.desk.change_view()
+        self.store.claim('別の処理担当')
+        self.desk.drafts[self.first['id']] = {'choice': 'minimal', 'memo': '保持する下書き'}
+        handle_key(self.desk, 'u')
+        self.assertIn('変更できません', self.desk.notice)
+        self.assertEqual(self.desk.item['answer']['status'], 'pending')
+        self.assertEqual(self.desk.draft()['memo'], '保持する下書き')
+        self.assertEqual(self.store.get(self.first['id'])['answer']['status'], 'processing')
+        self.desk.refresh()
+        handle_key(self.desk, 'u')
+        self.assertIn('処理開始後', self.desk.notice)
+
+    def test_stopped_reason_is_first_and_retry_is_explicit(self):
+        self.store.answer(self.first['id'], {'choice': 'refactor', 'memo': '回答のメモ'})
+        claim = self.store.claim('処理担当')
+        self.store.report(self.first['id'], {'token': claim['token'], 'status': 'blocked', 'reason': '承認が必要', 'next_step': '承認後に再処理'})
+        self.desk.change_view()
+        lines, _ = detail_lines(self.desk, 100)
+        text = '\n'.join(line for line, _ in lines)
+        self.assertLess(text.index('承認が必要'), text.index('判断が必要な理由'))
+        self.assertIn('承認後に再処理', text)
+        self.assertIn('t: 再処理', text)
+        self.assertEqual(self.store.get(self.first['id'])['answer']['status'], 'blocked')
+        handle_key(self.desk, 't')
+        self.assertEqual(self.store.get(self.first['id'])['answer']['status'], 'pending')
+        self.assertFalse(self.desk.item['answer']['can_undo'])
+
+    def test_stale_retry_preserves_new_report(self):
+        self.store.answer(self.first['id'], {'choice': 'minimal'})
+        claim = self.store.claim('処理担当')
+        self.store.report(self.first['id'], {'token': claim['token'], 'status': 'failed', 'reason': '最初の失敗', 'next_step': '再確認'})
+        self.desk.change_view()
+        self.store.retry(self.first['id'], {key: self.desk.item['answer'][key] for key in ('decided_at', 'reported_at')})
+        claim = self.store.claim('処理担当')
+        self.store.report(self.first['id'], {'token': claim['token'], 'status': 'failed', 'reason': '新しい失敗', 'next_step': 'もう一度確認'})
+        handle_key(self.desk, 't')
+        self.assertIn('変更できません', self.desk.notice)
+        self.assertEqual(self.store.get(self.first['id'])['answer']['reason'], '新しい失敗')
+
+    def test_external_undo_keeps_case_and_draft_visible(self):
+        saved = self.store.answer(self.first['id'], {'choice': 'minimal'})
+        self.desk.change_view()
+        self.store.undo(self.first['id'], {'decided_at': saved['answer']['decided_at']})
+        self.desk.refresh()
+        self.assertEqual(self.desk.view, 'pending')
+        self.assertEqual(self.desk.item['id'], self.first['id'])
+        self.assertIsNone(self.desk.item['answer'])
+
     def test_conflict_and_write_failure_preserve_draft(self):
         self.desk.draft()['memo'] = '保存前のメモ'
         with patch.object(self.store, 'answer', side_effect=sqlite3.OperationalError('書き込み失敗')):

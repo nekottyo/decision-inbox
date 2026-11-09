@@ -65,6 +65,7 @@ export default function App() {
             selectedItem = linked || visibleItems(data.decisions, view, previous.priority)[0] || null;
           } else if (selectedItem.answer) {
             selectedItem = data.decisions.find(item => item.id === selectedItem.id) || selectedItem;
+            if (!selectedItem.answer) view = 'pending';
           }
           let notice = previous.notice;
           if (!previous.loading && changed) {
@@ -165,6 +166,35 @@ export default function App() {
     }
   }
 
+  async function revise(action) {
+    const {selectedItem} = current.current;
+    if (saving.current || !selectedItem?.answer) return;
+    const answer = selectedItem.answer;
+    if (action === 'undo' ? !answer.can_undo : !['blocked', 'failed'].includes(answer.status)) return;
+    saving.current = true;
+    version.current += 1;
+    setState(previous => ({...previous, saving: true, error: '', errorKind: ''}));
+    try {
+      const body = {decided_at: answer.decided_at};
+      if (action === 'retry') body.reported_at = answer.reported_at;
+      const updated = await api(`/api/decisions/${encodeURIComponent(selectedItem.id)}/${action}`, body);
+      const draft = action === 'undo' ? {choice: answer.choice, memo: answer.memo} : emptyDraft();
+      if (action === 'undo') drafts.current.set(updated.id, draft);
+      focusDetail.current = true;
+      setState(previous => ({...previous,
+        cases: previous.cases.map(item => item.id === updated.id ? updated : item),
+        view: action === 'undo' ? 'pending' : 'done', selectedItem: updated, draft,
+        notice: action === 'undo' ? '回答を取り消し、判断待ちへ戻しました。候補とメモは下書きに残しています。' : '再処理を依頼しました。依頼元の処理を待っています。',
+      }));
+    } catch (error) {
+      setState(previous => ({...previous, errorKind: 'save',
+        error: `${action === 'undo' ? '回答を取り消せませんでした' : '再処理を依頼できませんでした'}。${error.message}。表示と入力は保持しています。最新の状態を確認してください。`}));
+    } finally {
+      saving.current = false;
+      setState(previous => ({...previous, saving: false}));
+    }
+  }
+
   return <DecisionDesk
     items={visibleItems(state.cases, state.view, state.priority)}
     counts={{pending: state.cases.filter(item => !item.answer).length, done: state.cases.filter(item => item.answer).length}}
@@ -172,5 +202,6 @@ export default function App() {
     loading={state.loading} saving={state.saving} demo={state.demo} notice={state.notice} error={state.error}
     detailRef={detailRef} onViewChange={changeView} onPriorityChange={changePriority} onSelect={select}
     onDraftChange={changeDraft} onSubmit={submit} onDefer={defer}
+    onUndo={() => revise('undo')} onRetry={() => revise('retry')}
   />;
 }

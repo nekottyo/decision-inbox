@@ -81,11 +81,13 @@
 .memo-help { margin: 6px 0 0; color: var(--desk-muted); font-size: 11px; }
 .form-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 18px; }
 .form-hint { margin: 8px 0 0; text-align: right; color: var(--desk-muted); font-size: 11px; }
-.result { padding-top: 22px; border-top: 1px solid var(--desk-line); }
+.result { padding: 0 0 22px; margin-bottom: 22px; border-bottom: 1px solid var(--desk-line); }
 .result > h3 { margin-bottom: 16px; font-size: 16px; }
 .result dl { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 12px 16px; margin: 0; font-size: 13px; }
 .result dt { color: var(--desk-muted); }
 .result dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.answer-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 18px; }
+.answer-actions:empty { display: none; }
 .followup { margin: 22px 0 12px; color: var(--desk-muted); font-size: 12px; }
 .answered-options { font-size: 13px; }
 .answered-options summary { width: fit-content; padding: 5px 0; color: var(--desk-muted); cursor: pointer; }

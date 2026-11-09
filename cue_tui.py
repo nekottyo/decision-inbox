@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import webbrowser
 
 PRIORITIES = {'urgent': 'すぐ判断', 'normal': '通常', 'later': 'あとでよい'}
-STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了'}
+STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了', 'blocked': '承認・条件待ち', 'failed': '失敗'}
 FILTERS = ('all', 'urgent', 'normal', 'later')
 BIDI = set('\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069')
 
@@ -138,6 +138,9 @@ class Desk:
                 self.item = current
                 if previous_answer is None and current['answer'] is not None:
                     self.notice = '別の画面で判断済みです。下書きは保持しています。←→で案件を移動できます'
+                elif previous_answer is not None and current['answer'] is None:
+                    self.view = 'pending'
+                    self.notice = '回答が取り消され、判断待ちへ戻りました。下書きは保持しています'
         elif self.visible():
             self.select(self.visible()[0])
         if old_ids and {item['id'] for item in fresh} - old_ids and not self.notice:
@@ -223,6 +226,33 @@ class Desk:
         defaults = {item['id']: item['options'][0]['id'] for item in self.items}
         return any(draft['memo'] or draft['choice'] not in (None, defaults.get(identifier)) for identifier, draft in self.drafts.items())
 
+    def revise(self, action):
+        answer = self.item['answer'] if self.item else None
+        if not answer:
+            self.notice = '判断済みの案件で操作してください'
+            return
+        if action == 'undo' and not answer.get('can_undo'):
+            self.notice = '処理開始後の回答は取り消せません'
+            return
+        if action == 'retry' and answer['status'] not in ('blocked', 'failed'):
+            self.notice = '承認・条件待ち、または失敗した案件だけ再処理を依頼できます'
+            return
+        payload = {'decided_at': answer['decided_at']}
+        if action == 'retry':
+            payload['reported_at'] = answer['reported_at']
+        try:
+            updated = getattr(self.store, action)(self.item['id'], payload)
+        except Exception as error:
+            self.notice = f'変更できません: {error}。表示と下書きは保持しています'
+            return
+        if action == 'undo':
+            self.drafts[updated['id']] = {'choice': answer['choice'], 'memo': answer['memo']}
+            self.view = 'pending'
+        self.item = updated
+        self.refresh()
+        self.scroll = 0
+        self.notice = '回答を取り消し、判断待ちへ戻しました。候補とメモは下書きに残しています' if action == 'undo' else '再処理を依頼しました。依頼元の処理を待っています'
+
     def links(self):
         if not self.item:
             return []
@@ -259,6 +289,18 @@ def detail_lines(desk, columns):
     append(item['title'], curses.A_BOLD)
     status = STATUSES.get(item['answer']['status'], '判断済み') if item['answer'] else '判断待ち'
     append(f"[{PRIORITIES[item['priority']]}] {status}")
+    if item['answer']:
+        answer = item['answer']
+        if answer.get('reason'):
+            append(f"止まった理由: {answer['reason']}", curses.A_BOLD)
+        if answer.get('next_step'):
+            append(f"再開に必要なこと: {answer['next_step']}")
+        if answer.get('can_undo'):
+            append('u: 回答を取り消す (処理開始前のみ)')
+        elif answer['status'] in ('blocked', 'failed'):
+            append('t: 再処理を依頼する / 自動では再試行しません')
+        else:
+            append('処理開始後の回答は取り消せません')
     append(f"依頼元: {item['source']}  受付: {item['created_at']}")
     if item.get('deadline'):
         append(f"期限: {item['deadline']}")
@@ -360,7 +402,7 @@ def draw(screen, desk):
     message = desk.load_error or desk.notice
     put(rows - 4, 1, message, curses.A_BOLD)
     put(rows - 3, 1, '↑↓ 選択  Enter 確定  ←→ 案件  m メモ  PgUp/PgDn スクロール')
-    put(rows - 2, 1, 'Esc 閉じる  Tab 待ち/済み  f 優先度  w Web  o 関連リンク  ? ヘルプ  q 終了確認')
+    put(rows - 2, 1, 'Esc 閉じる  Tab 待ち/済み  u 取消  t 再処理  f 優先度  w Web  o リンク  ? ヘルプ')
     if desk.mode:
         screen.erase()
         if desk.mode == 'quit':
@@ -376,7 +418,7 @@ def draw(screen, desk):
                 put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
             put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で閉じる')
         else:
-            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
+            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
             for index, line in enumerate(help_lines):
                 put(index + 1, 2, line, curses.A_BOLD if index == 0 else 0)
     screen.noutrefresh()
@@ -434,6 +476,10 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
         desk.scroll = max(0, desk.scroll - page_height)
     elif key == 'r':
         desk.refresh()
+    elif key == 'u':
+        desk.revise('undo')
+    elif key == 't':
+        desk.revise('retry')
     elif key == 'w':
         desk.open_web()
     elif key == 'o':

@@ -91,6 +91,23 @@ js <<'JS'
 assert(document.querySelector('.result').textContent.includes('入力中のメモ <保持>'),'reload 後の回答保持');
 assert(document.querySelector('#processing-status').textContent.includes('処理待ち'),'確定だけで完了にしない');
 assert(document.querySelector('.related a') && document.querySelector('.background-section'),'判断済みでも背景とリンクを表示');
+assert(document.querySelector('#undo-answer'),'処理開始前の回答を取り消せる');
+return '合格：永続回答・判断済み表示';
+JS
+ab click '#undo-answer' >/dev/null
+ab wait '#confirm' >/dev/null
+js <<'JS'
+assert(document.querySelector('#detail h2').textContent==='緊急の判断','取り消した案件を選択保持');
+assert(document.querySelector('#memo').value==='入力中のメモ <保持>' && document.querySelector('input[value="a"]').checked,'取り消した回答を下書きに保持');
+assert(document.querySelector('#pending-count').textContent==='3','判断待ちへ復帰');
+return '合格：回答の取り消しと下書き保持';
+JS
+ab scrollintoview '#confirm' >/dev/null
+ab click '#confirm' >/dev/null
+ab wait --fn "document.querySelector('#pending-count').textContent === '2'" >/dev/null
+ab click '[data-view="done"]' >/dev/null
+ab wait '.result' >/dev/null
+js <<'JS'
 const claim=await fetch('/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker:'ui-self-check'})}).then(r=>r.json());
 assert(claim.decision.id===JSON.parse(window.name).urgent,'回答済みを claim');
 const r=await fetch('/api/decisions/'+claim.decision.id+'/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:claim.token})});
@@ -104,6 +121,35 @@ js <<'JS'
 assert(document.querySelector('#detail h2').textContent==='緊急の判断','判断済みへの deep link');
 assert(document.querySelector('#processing-status').textContent.includes('完了'),'deep link でも後続処理状態を表示');
 return '合格：判断済みの deep link';
+JS
+js <<'JS'
+assert(!document.querySelector('#undo-answer'),'処理開始後は取り消せない');
+const payload={...JSON.parse(window.name).request,title:'停止した判断',priority:'normal'};
+const stopped=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(r=>r.json());
+await fetch('/api/decisions/'+stopped.id+'/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice:'b',memo:'停止確認'})});
+const claim=await fetch('/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker:'ui-stop-check'})}).then(r=>r.json());
+assert(claim.decision.id===stopped.id,'停止対象を claim');
+const reported=await fetch('/api/decisions/'+stopped.id+'/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:claim.token,status:'blocked',reason:'承認待ち <確認>',next_step:'条件を確認して再処理'})});
+assert(reported.ok,'承認待ちを報告');
+window.name=JSON.stringify({...JSON.parse(window.name),stopped:stopped.id});
+window.location.href='/?decision='+stopped.id;
+JS
+ab wait '#retry-answer' >/dev/null
+js <<'JS'
+assert(document.querySelector('#processing-status').textContent.includes('承認・条件待ち'),'停止状態の表示');
+assert(document.querySelector('#processing-reason').textContent==='承認待ち <確認>','停止理由を安全に表示');
+assert(document.querySelector('#processing-next-step').textContent==='条件を確認して再処理','再開条件の表示');
+assert(document.querySelector('.result').getBoundingClientRect().top < document.querySelector('.context').getBoundingClientRect().top,'停止理由を背景より先に表示');
+assert(!document.querySelector('#undo-answer'),'一度処理を開始した案件の取り消し禁止');
+return '合格：停止状態・理由・再開条件';
+JS
+ab click '#retry-answer' >/dev/null
+ab wait --fn "document.querySelector('#processing-status').textContent.includes('処理待ち') && !document.querySelector('#retry-answer')" >/dev/null
+js <<'JS'
+assert(!document.querySelector('#undo-answer'),'再処理待ちでも取り消し禁止');
+const item=await fetch('/api/decisions/'+JSON.parse(window.name).stopped).then(r=>r.json());
+assert(item.answer.status==='pending' && !item.answer.reason,'明示操作で再処理待ちへ');
+return '合格：再処理の明示依頼';
 JS
 ab click '[data-view="pending"]' >/dev/null
 ab check 'input[value="a"]' >/dev/null
