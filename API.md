@@ -63,7 +63,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 complete --id ID --token TOKEN
 
 ## 回答の通知
 
-`watch --interval 2 --timeout 1740` は DB を読み取り専用で開き、処理可能になった回答の ID だけを stdout へ JSONL で即時出力します。HTTP server の起動は不要で、未作成の DB を新規作成しません。
+`watch --interval 2 --timeout 1740` は DB を読み取り専用で開き、処理可能になった回答の ID だけを stdout へ JSONL で即時出力します。HTTP server の起動は不要で、未作成の DB を新規作成しません。長行を分割する通知先でも各 JSON が欠けないよう、1 行あたり最大 100 ID に分けます。
 
 ```json
 {"event":"cue.ready","decision_ids":["回答済みの ID"]}

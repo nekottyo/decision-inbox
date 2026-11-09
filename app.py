@@ -415,8 +415,8 @@ def watch_ready(store, interval, timeout):
         while True:
             ready = store.ready()
             added = [identifier for identifier in ready if identifier not in previous]
-            if added:
-                print(json.dumps({'event': 'cue.ready', 'decision_ids': added}), flush=True)
+            for offset in range(0, len(added), 100):
+                print(json.dumps({'event': 'cue.ready', 'decision_ids': added[offset:offset + 100]}), flush=True)
             previous = set(ready)
             remaining = deadline - time.monotonic()
             if remaining <= 0:

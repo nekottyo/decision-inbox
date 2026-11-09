@@ -61,6 +61,19 @@ class WatchTests(unittest.TestCase):
         ])
         self.assertEqual(clock[0], 4)
 
+    def test_watch_batches_large_ready_sets_into_complete_json_lines(self):
+        identifiers = [f'{index:032x}' for index in range(250)]
+        store = SimpleNamespace(ready=Mock(return_value=identifiers))
+        output = io.StringIO()
+        with patch('app.time.monotonic', side_effect=[0, 1]), contextlib.redirect_stdout(output):
+            self.assertEqual(watch_ready(store, 2, 1), 0)
+        lines = output.getvalue().splitlines()
+        events = [json.loads(line) for line in lines]
+        self.assertEqual([event['event'] for event in events], ['cue.ready'] * 3)
+        self.assertEqual([len(event['decision_ids']) for event in events], [100, 100, 50])
+        self.assertEqual([identifier for event in events for identifier in event['decision_ids']], identifiers)
+        self.assertTrue(all(len(line.encode()) < 65536 for line in lines))
+
     def test_cli_flushes_initial_ready_event_and_stops_on_interrupt(self):
         identifier = self.answered()
         before = self.store.list()
