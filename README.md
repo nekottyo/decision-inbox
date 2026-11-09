@@ -61,7 +61,7 @@ herdr plugin action invoke nekottyo.cue.open
 
 ```toml
 [[keys.command]]
-key = "prefix+shift+c"
+key = "prefix+shift+u"
 type = "plugin_action"
 command = "nekottyo.cue.open"
 description = "Cue: 判断する"
