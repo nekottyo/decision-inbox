@@ -49,13 +49,26 @@ lease_seconds は省略時 300、1〜3600 秒。front-desk は 3600 秒を指定
 python3 app.py --db /tmp/decision-test.sqlite3 serve --port 4317
 python3 app.py --db /tmp/decision-test.sqlite3 add --file request.json
 python3 app.py --db /tmp/decision-test.sqlite3 list
+python3 app.py --db /tmp/decision-test.sqlite3 watch --interval 2 --timeout 1740
 python3 app.py --db /tmp/decision-test.sqlite3 tui --web-url http://127.0.0.1:4317/
 python3 app.py --db /tmp/decision-test.sqlite3 claim --worker front-desk --lease-seconds 300
 python3 app.py --db /tmp/decision-test.sqlite3 complete --id ID --token TOKEN
 ```
 
-`tui` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
+`tui` と `watch` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
 
 エラー body は `{"error":"説明"}`。入力不正 `400`、未発見 `404`、競合 `409`、body 過大 `413`、JSON 以外 `415`、Host/origin 不正 `403`、永続化エラー `500`。削除・実データ初期化 API は提供しない。
 
 `tui` は対話端末で同じ Store を利用し、選択した回答を既存の回答保存処理に渡します。非 TTY では DB を作らずエラー終了します。`--web-url` / `CUE_WEB_URL` は任意で、loopback の http(s) URL のみです。Web の `?decision=<id>` は対象の未判断または判断済みを初期表示し、不明な ID では通常の優先度順表示になります。
+
+## 回答の通知
+
+`watch --interval 2 --timeout 1740` は DB を読み取り専用で開き、処理可能になった回答の ID だけを stdout へ JSONL で即時出力します。HTTP server の起動は不要で、未作成の DB を新規作成しません。
+
+```json
+{"event":"cue.ready","decision_ids":["回答済みの ID"]}
+```
+
+対象は `pending` または lease の期限が切れた `processing` です。未回答・完了・有効な lease の処理中案件を除外し、ID は claim と同じ回答日時順です。起動時に既存の対象も通知し、同じ対象が処理可能なままなら繰り返し通知しません。対象外になった後に再び処理可能になると再通知します。ポーリング間に完了した状態遷移は検知できないため、通知を完全なイベント履歴として扱わないでください。再起動時は処理可能な対象を再通知します。
+
+`--interval` と `--timeout` は正の有限秒数で、既定は 2 秒と 1740 秒です。timeout または Ctrl+C で正常終了し、DB エラーは stderr の JSON と非ゼロ終了で通知します。timeout は通知先が終了を受けて張り直すための境界です。watch 自体は agent を起動せず、claim・complete・再送・ハーネス連携を行いません。本文・回答内容・メモ・token を通知に含めません。通知先はその時点の状態を CLI で再取得し、有効な claim の取得後にだけ処理してください。

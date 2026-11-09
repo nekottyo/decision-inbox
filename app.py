@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -131,8 +132,11 @@ def parse_json(raw):
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, readonly=False):
         self.path = str(path)
+        self.readonly = readonly
+        if readonly:
+            return
         parent = Path(path).parent
         if not parent.exists():
             parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -152,7 +156,8 @@ class Store:
 
     @contextmanager
     def db(self):
-        connection = sqlite3.connect(self.path, timeout=10)
+        target = Path(self.path).resolve().as_uri() + '?mode=ro' if self.readonly else self.path
+        connection = sqlite3.connect(target, timeout=10, uri=self.readonly)
         connection.row_factory = sqlite3.Row
         try:
             with connection:
@@ -179,6 +184,10 @@ class Store:
     def list(self):
         with self.db() as connection:
             return [self.public(row) for row in connection.execute('SELECT * FROM decisions ORDER BY created_at,id')]
+
+    def ready(self):
+        with self.db() as connection:
+            return [row['id'] for row in connection.execute("SELECT id FROM decisions WHERE status='pending' OR (status='processing' AND lease_until<=?) ORDER BY decided_at,id", (time.time(),))]
 
     def get(self, identifier):
         with self.db() as connection:
@@ -392,6 +401,32 @@ def tui_web_url(value):
     return value
 
 
+def positive_seconds(value):
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError('秒数は正の有限値を指定してください')
+    return seconds
+
+
+def watch_ready(store, interval, timeout):
+    deadline = time.monotonic() + timeout
+    previous = set()
+    try:
+        while True:
+            ready = store.ready()
+            added = [identifier for identifier in ready if identifier not in previous]
+            if added:
+                print(json.dumps({'event': 'cue.ready', 'decision_ids': added}), flush=True)
+            previous = set(ready)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local decision inbox')
     parser.add_argument('--db', type=Path, default=default_db())
@@ -402,6 +437,9 @@ def main(argv=None):
     add = commands.add_parser('add')
     add.add_argument('--file', type=Path, required=True)
     commands.add_parser('list')
+    watch = commands.add_parser('watch', help='処理可能な回答の ID を JSONL で通知する')
+    watch.add_argument('--interval', type=positive_seconds, default=2)
+    watch.add_argument('--timeout', type=positive_seconds, default=1740)
     tui = commands.add_parser('tui', help='判断を端末で確認して回答する')
     tui.add_argument('--web-url', default=os.environ.get('CUE_WEB_URL') or None)
     claim = commands.add_parser('claim')
@@ -431,7 +469,9 @@ def main(argv=None):
                 except KeyboardInterrupt:
                     pass
             return 0
-        store = Store(args.db)
+        store = Store(args.db, readonly=args.command == 'watch')
+        if args.command == 'watch':
+            return watch_ready(store, args.interval, args.timeout)
         if args.command == 'add':
             with args.file.open('rb') as handle:
                 raw = handle.read(MAX_BODY + 1)

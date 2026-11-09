@@ -101,6 +101,16 @@ Web で回答すると「処理待ち」になり、claim で「対応中」、c
 
 `app.py` は実行可能な CLI entry point です。窓口側で symlink を設置した環境では、上記の `python3 app.py` を `decision-inbox` に置き換えられます。この repo 自体は symlink の設置や harness の起動を行いません。
 
+## 回答を検知する
+
+```sh
+decision-inbox watch --interval 2 --timeout 1740
+```
+
+新たに処理可能になった回答を `{"event":"cue.ready","decision_ids":["ID"]}` の JSONL で通知します。起動時の処理待ちと lease 期限切れも対象で、有効な lease の対応中案件は通知しません。同じ回答が待ち続けている間は繰り返し出力せず、timeout または Ctrl+C で終了します。DB は読み取り専用で開き、未作成ならエラー終了します。
+
+Claude の Monitor や Codex 側の通知機構は、この出力を受けて窓口を再開できます。通知先の選択・起動・終了時の張り直しは窓口側の責任で、Cue 本体は特定の harness を起動しません。通知は処理権の取得ではないため、既存の claim / complete 手順を通してください。詳細は [API.md](API.md) を参照してください。
+
 ## agent が処理する場合
 
 任意の harness から CLI または API を呼びます。キュー本体は agent の起動、API key、pane 操作、LLM 実行を組み込みません。agent 向けの短い規律は [AGENTS.md](AGENTS.md) にあります。
