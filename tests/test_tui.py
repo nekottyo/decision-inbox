@@ -148,7 +148,7 @@ class TuiTests(unittest.TestCase):
             draw(screen, self.desk)
         self.assertIn('戻る', ''.join(screen.output))
 
-    def test_editor_uses_argv_and_rejects_oversized_memo(self):
+    def test_editor_uses_argv_and_preserves_oversized_memo(self):
         filenames = []
 
         def write_memo(arguments, check):
@@ -170,9 +170,29 @@ class TuiTests(unittest.TestCase):
             return subprocess.CompletedProcess(arguments, 0)
 
         with patch.dict(os.environ, {'VISUAL': '', 'EDITOR': 'fake-editor'}), patch('cue_tui.subprocess.run', side_effect=too_long):
-            with self.assertRaises(ValueError):
-                edit_with_editor('元のメモ')
+            self.assertEqual(edit_with_editor('元のメモ'), '𠮷' * 2001)
         self.assertTrue(all(not Path(path).exists() for path in filenames))
+        handle_key(self.desk, curses.KEY_DOWN)
+        handle_key(self.desk, 'm', edit=lambda value: '𠮷' * 2001)
+        handle_key(self.desk, '\r')
+        self.assertIsNone(self.store.get(self.first['id'])['answer'])
+        self.assertEqual(self.desk.draft()['memo'], '𠮷' * 2001)
+
+    def test_link_picker_scrolls_to_selected_link(self):
+        self.desk.item = {**self.desk.item, 'links': [{'label': f'関連{index}', 'url': f'https://example.com/{index}'} for index in range(20)]}
+        self.desk.mode, self.desk.menu_index = 'links', 19
+        screen = Screen(12, 50)
+        with patch('cue_tui.curses.doupdate'):
+            draw(screen, self.desk)
+        self.assertIn('関連19', screen.output)
+        self.assertNotIn('関連0', screen.output)
+
+    def test_failed_initial_read_is_not_an_empty_queue(self):
+        with patch.object(self.store, 'list', side_effect=sqlite3.OperationalError('取得失敗')):
+            desk = Desk(self.store)
+        lines, _ = detail_lines(desk, 60)
+        self.assertIn('読み込めません', lines[0][0])
+        self.assertIn('取得失敗', desk.load_error)
 
     def test_web_and_related_links_open_only_after_explicit_keys(self):
         for target in ['file:///tmp/secret', 'javascript:alert(1)', 'https://a.test/\x1b', 'https://user:password@a.test/']:

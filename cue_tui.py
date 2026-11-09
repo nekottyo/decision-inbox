@@ -102,8 +102,6 @@ def edit_with_editor(memo):
         if result.returncode:
             raise ValueError('メモの編集を中止しました。元の入力を保持しています')
         updated = Path(filename).read_text(encoding='utf-8')
-        if len(updated) > 2000:
-            raise ValueError('メモは 2,000 文字までです。元の入力を保持しています')
         if '\x00' in updated or any(0xD800 <= ord(char) <= 0xDFFF for char in updated):
             raise ValueError('メモに保存できない文字があります。元の入力を保持しています')
         return updated
@@ -248,7 +246,7 @@ def detail_lines(desk, columns):
     lines, choice_positions = [], {}
     item = desk.item
     if not item:
-        message = '判断待ちの案件はありません' if desk.view == 'pending' else '判断済みの案件はありません'
+        message = '判断を読み込めません。r で再試行してください' if desk.load_error else ('判断待ちの案件はありません' if desk.view == 'pending' else '判断済みの案件はありません')
         return [(message, curses.A_BOLD)], choice_positions
 
     def append(value='', attribute=0):
@@ -368,8 +366,10 @@ def draw(screen, desk):
             put(rows - 2, 2, '↑↓ / ←→で選択、Enter で決定、Esc で戻る')
         elif desk.mode == 'links':
             put(1, 2, '関連リンクを開く', curses.A_BOLD)
-            for index, (label, target) in enumerate(desk.links()):
-                put(3 + index * 2, 2, label, curses.A_REVERSE if desk.menu_index == index else 0)
+            visible = max(1, (rows - 5) // 2)
+            first = max(0, desk.menu_index - visible + 1)
+            for offset, (label, target) in enumerate(desk.links()[first:first + visible]):
+                put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
             put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で戻る')
         else:
             help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'q / Esc: 終了 (未保存入力があれば確認)', '', 'Enter / Esc / ? で戻る']
@@ -438,7 +438,7 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
         if desk.item and desk.item['answer'] is None:
             try:
                 desk.draft()['memo'] = edit(desk.draft()['memo'])
-                desk.notice = 'メモを下書きに反映しました。回答の確定時に保存します'
+                desk.notice = 'メモは 2,000 文字までです。下書きは保持しています。m で修正してください' if len(desk.draft()['memo']) > 2000 else 'メモを下書きに反映しました。回答の確定時に保存します'
             except (Exception, KeyboardInterrupt) as error:
                 desk.notice = str(error) or 'メモの編集を中止しました。元の入力を保持しています'
         else:
