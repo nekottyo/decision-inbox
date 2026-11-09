@@ -49,10 +49,13 @@ lease_seconds は省略時 300、1〜3600 秒。front-desk は 3600 秒を指定
 python3 app.py --db /tmp/decision-test.sqlite3 serve --port 4317
 python3 app.py --db /tmp/decision-test.sqlite3 add --file request.json
 python3 app.py --db /tmp/decision-test.sqlite3 list
+python3 app.py --db /tmp/decision-test.sqlite3 tui --web-url http://127.0.0.1:4317/
 python3 app.py --db /tmp/decision-test.sqlite3 claim --worker front-desk --lease-seconds 300
 python3 app.py --db /tmp/decision-test.sqlite3 complete --id ID --token TOKEN
 ```
 
-CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
+`tui` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
 
 エラー body は `{"error":"説明"}`。入力不正 `400`、未発見 `404`、競合 `409`、body 過大 `413`、JSON 以外 `415`、Host/origin 不正 `403`、永続化エラー `500`。削除・実データ初期化 API は提供しない。
+
+`tui` は対話端末で同じ Store を利用し、選択した回答を既存の回答保存処理に渡します。非 TTY では DB を作らずエラー終了します。`--web-url` / `CUE_WEB_URL` は任意で、loopback の http(s) URL のみです。Web の `?decision=<id>` は対象の未判断または判断済みを初期表示し、不明な ID では通常の優先度順表示になります。

@@ -35,6 +35,7 @@ export default function App() {
   const version = useRef(0);
   const focusDetail = useRef(false);
   const detailRef = useRef(null);
+  const linkedDecision = useRef(new URLSearchParams(window.location.search).get('decision'));
 
   useLayoutEffect(() => {
     if (focusDetail.current) {
@@ -52,11 +53,16 @@ export default function App() {
       try {
         const data = await api('/api/decisions');
         if (!active || saving.current || requestedVersion !== version.current) return;
+        const requestedDecision = linkedDecision.current;
+        linkedDecision.current = null;
         setState(previous => {
           const changed = JSON.stringify(previous.cases) !== JSON.stringify(data.decisions);
+          let view = previous.view;
           let selectedItem = previous.selectedItem;
           if (!selectedItem) {
-            selectedItem = visibleItems(data.decisions, previous.view, previous.priority)[0] || null;
+            const linked = data.decisions.find(item => item.id === requestedDecision);
+            if (linked) view = linked.answer ? 'done' : 'pending';
+            selectedItem = linked || visibleItems(data.decisions, view, previous.priority)[0] || null;
           } else if (selectedItem.answer) {
             selectedItem = data.decisions.find(item => item.id === selectedItem.id) || selectedItem;
           }
@@ -67,7 +73,7 @@ export default function App() {
               ? '表示中の案件に変更があります。入力を保持しています。一覧から案件を選び直すと最新の状態を確認できます。'
               : '新着または処理状態の変更があります。一覧を更新しました。';
           }
-          return {...previous, cases: data.decisions, selectedItem, loading: false, demo: data.demo, notice,
+          return {...previous, cases: data.decisions, view, selectedItem, loading: false, demo: data.demo, notice,
             draft: selectedItem?.id === previous.selectedItem?.id ? previous.draft : drafts.current.get(selectedItem?.id) || emptyDraft(),
             error: previous.errorKind === 'load' ? '' : previous.error,
             errorKind: previous.errorKind === 'load' ? '' : previous.errorKind};

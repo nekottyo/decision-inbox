@@ -383,6 +383,15 @@ def default_db():
     return Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local' / 'share'))) / 'decision-inbox' / 'decisions.sqlite3'
 
 
+def tui_web_url(value):
+    if value is None:
+        return None
+    url(value)
+    if urlsplit(value).hostname not in ('localhost', '127.0.0.1', '::1'):
+        raise AppError(400, 'Web の URL は loopback の http(s) URL を指定してください')
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local decision inbox')
     parser.add_argument('--db', type=Path, default=default_db())
@@ -393,6 +402,8 @@ def main(argv=None):
     add = commands.add_parser('add')
     add.add_argument('--file', type=Path, required=True)
     commands.add_parser('list')
+    tui = commands.add_parser('tui', help='判断を端末で確認して回答する')
+    tui.add_argument('--web-url', default=os.environ.get('CUE_WEB_URL') or None)
     claim = commands.add_parser('claim')
     claim.add_argument('--worker', required=True)
     claim.add_argument('--lease-seconds', type=int, default=300)
@@ -401,6 +412,15 @@ def main(argv=None):
     complete.add_argument('--token', required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == 'tui':
+            web_url = tui_web_url(args.web_url)
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise AppError(400, 'TUI は対話可能な端末から起動してください')
+            try:
+                from cue_tui import run
+            except ImportError:
+                raise AppError(400, 'この環境では TUI を利用できません') from None
+            return run(Store(args.db), web_url=web_url)
         if args.command == 'serve':
             if not 0 <= args.port <= 65535:
                 raise AppError(400, 'port は 0〜65535 を指定してください')

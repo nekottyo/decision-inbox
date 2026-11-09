@@ -1,0 +1,19 @@
+id = "nekottyo.cue"
+name = "Cue"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "判断待ちを読み、矢印と Enter で回答する Cue の端末画面"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "open"
+title = "Cue: 判断する"
+command = ["python3", "cue_plugin.py", "open"]
+
+[[panes]]
+id = "desk"
+title = "Cue"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["python3", "cue_plugin.py", "tui"]

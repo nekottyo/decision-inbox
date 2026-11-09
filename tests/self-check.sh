@@ -20,7 +20,15 @@ const normal=await add(request('通常の判断','normal'));
 window.name=JSON.stringify({urgent:urgent.id,normal:normal.id,request:request('新着の判断','urgent')});
 return '合格：API に検証用の依頼を登録';
 JS
-ab reload >/dev/null
+ab eval 'window.location.href = "/?decision=" + JSON.parse(window.name).normal' >/dev/null
+ab wait --fn "document.querySelector('#detail h2')?.textContent === '通常の判断'" >/dev/null
+js <<'JS'
+assert(document.querySelector('#case-list [aria-current="true"]').dataset.case===JSON.parse(window.name).normal,'Web deep link で対象の未判断を表示');
+return '合格：未判断の deep link';
+JS
+ab eval 'window.location.href = "/?decision=missing"' >/dev/null
+ab wait --fn "document.querySelector('#detail h2')?.textContent === '緊急の判断'" >/dev/null
+ab open "$check_url" >/dev/null
 ab wait '#confirm' >/dev/null
 js <<'JS'
 assert(document.querySelector('#detail h2').textContent==='緊急の判断','緊急順');
@@ -90,6 +98,13 @@ assert(r.ok,'後続処理を完了');
 return '合格：永続回答・判断済み表示・後続処理';
 JS
 ab wait --fn "document.querySelector('#processing-status').textContent.includes('完了')" >/dev/null
+ab eval 'window.location.href = "/?decision=" + JSON.parse(window.name).urgent' >/dev/null
+ab wait '.result' >/dev/null
+js <<'JS'
+assert(document.querySelector('#detail h2').textContent==='緊急の判断','判断済みへの deep link');
+assert(document.querySelector('#processing-status').textContent.includes('完了'),'deep link でも後続処理状態を表示');
+return '合格：判断済みの deep link';
+JS
 ab click '[data-view="pending"]' >/dev/null
 ab check 'input[value="a"]' >/dev/null
 ab fill '#memo' '競合時にも保持するメモ' >/dev/null
