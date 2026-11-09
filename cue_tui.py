@@ -282,7 +282,7 @@ def detail_lines(desk, columns):
     choice = desk.draft()['choice'] if item['answer'] is None else item['answer']['choice']
     for index, option in enumerate(item['options']):
         choice_positions[option['id']] = len(lines)
-        marker = '[選択]' if choice == option['id'] else '[    ]'
+        marker = '●' if choice == option['id'] else ' '
         recommended = ' [推奨]' if item['recommended'] == option['id'] else ''
         append(f"{index + 1}. {marker} {option['title']}{recommended}", curses.A_BOLD if choice == option['id'] else 0)
         if option['benefits']:
