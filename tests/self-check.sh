@@ -1,122 +1,111 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-check_url=${1:-http://127.0.0.1:4317}
-check_session="decision-inbox-selfcheck-$$"
+check_url=${1:?専用の空テスト DB を使用する server URL を指定してください}
+check_session="decision-inbox-api-selfcheck-$$"
 ab() { agent-browser --session "$check_session" "$@"; }
 js() {
-  { printf '%s\n' '(() => { const assert = (ok, message) => { if (!ok) throw new Error(message); };'; cat; printf '\n})();\n'; } | ab eval --stdin >/dev/null
+  { printf '%s\n' '(async () => { const assert = (ok, message) => { if (!ok) throw new Error(message); };'; cat; printf '\n})();\n'; } | ab eval --stdin
 }
-cleanup() {
-  check_result=$?
-  trap - EXIT
-  if ! js <<'JS'
-if (window.__originalSetItem) Storage.prototype.setItem = window.__originalSetItem;
-const backup = JSON.parse(window.name || '{}');
-if (backup.selfCheck) {
-  if (backup.answer === null) localStorage.removeItem('decision-inbox-demo:v1');
-  else localStorage.setItem('decision-inbox-demo:v1', backup.answer);
-  assert(localStorage.getItem('decision-inbox-demo:v1') === backup.answer, '元のデモ回答の復元');
-  localStorage.removeItem(backup.sentinel);
-  window.name = backup.windowName;
-}
-JS
-  then
-    printf '%s\n' '失敗：デモ回答の復元に失敗しました' >&2
-    check_result=1
-  fi
-  ab close >/dev/null || check_result=1
-  exit "$check_result"
-}
+trap 'ab close >/dev/null' EXIT
 ab open "$check_url" >/dev/null
 ab wait '#detail' >/dev/null
-trap cleanup EXIT
 js <<'JS'
-const sentinel = 'decision-inbox-selfcheck:' + crypto.randomUUID();
-window.name = JSON.stringify({ selfCheck: true, answer: localStorage.getItem('decision-inbox-demo:v1'), sentinel, windowName: window.name });
-localStorage.setItem(sentinel, '保護対象');
-localStorage.removeItem('decision-inbox-demo:v1');
+const initial = await fetch('/api/decisions').then(r => r.json());
+assert(initial.demo === false && initial.decisions.length === 0, '専用の空テスト DB のみ使用');
+const request = (title, priority) => ({title, priority, source:'操作検証', reason:'選択する方針の確認', background:'背景を最初から表示する <確認>', options:[{id:'a',title:'小さく直す',benefits:'確認範囲が小さい',concerns:'重複が残る'},{id:'b',title:'まとめて直す',benefits:'重複を減らす',concerns:'公開が遅れる'}], recommended:'a',recommendation:'影響範囲を限定',links:[{url:'https://github.com/example/repo/pull/1',label:'対象 PR <確認>',kind:'pr'},{url:'https://github.com/example/repo/issues/2',label:'関連 issue',kind:'issue'}],image:{url:'/assets/demo-flow.svg',alt:'修正から公開までの参考図'}});
+const add = async payload => {const r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); assert(r.ok,'依頼登録'); return r.json();};
+const urgent=await add(request('緊急の判断','urgent'));
+const normal=await add(request('通常の判断','normal'));
+window.name=JSON.stringify({urgent:urgent.id,normal:normal.id,request:request('新着の判断','urgent')});
+return '合格：API に検証用の依頼を登録';
 JS
 ab reload >/dev/null
 ab wait '#confirm' >/dev/null
 js <<'JS'
-assert(document.querySelector('#confirm').disabled, '未選択では確定不可');
-assert(document.querySelector('[data-case="review"]').getAttribute('aria-current') === 'true', 'すぐ判断を先頭に選択');
-assert(document.querySelector('#pending-count').textContent === '3', '初期の判断待ちは 3 件');
+assert(document.querySelector('#detail h2').textContent==='緊急の判断','緊急順');
+assert(document.querySelector('#confirm').disabled,'候補未選択では確定不可');
+assert(document.querySelector('.background-section')?.textContent.includes('背景を最初から表示する <確認>'),'背景を初期表示して安全に描画');
+assert(!document.querySelector('.background-section details'),'背景を折り畳まない');
+const link=document.querySelector('.related a');
+assert(link.href==='https://github.com/example/repo/pull/1' && link.target==='_blank' && link.rel.includes('noopener') && link.rel.includes('noreferrer'),'安全な PR リンク');
+assert(link.textContent.includes('対象 PR <確認>'),'リンクラベルの安全な描画');
+assert(document.querySelector('figure img').alt==='修正から公開までの参考図','画像の代替テキスト');
+return '合格：優先度・候補必須・背景・関連リンク・画像';
 JS
-ab check 'input[value="minimal"]' >/dev/null
-ab fill '#memo' '検証用メモ <安全に表示>' >/dev/null
+ab check 'input[value="a"]' >/dev/null
+ab fill '#memo' '入力中のメモ <保持>' >/dev/null
 js <<'JS'
-assert(!document.querySelector('#confirm').disabled, '選択後は確定可能');
-window.__originalSetItem = Storage.prototype.setItem;
-Storage.prototype.setItem = function (key, value) {
-  if (key === 'decision-inbox-demo:v1') throw new DOMException('検証用の保存失敗', 'QuotaExceededError');
-  return window.__originalSetItem.call(this, key, value);
-};
-JS
-ab click '#confirm' >/dev/null
-js <<'JS'
-assert(!document.querySelector('#error').hidden, '保存失敗を通知');
-assert(document.querySelector('#pending-count').textContent === '3', '保存失敗時は未確定');
-assert(document.querySelector('#memo').value === '検証用メモ <安全に表示>', '失敗時も入力を保持');
-assert(localStorage.getItem('decision-inbox-demo:v1') === null, '失敗した回答を書き込まない');
-Storage.prototype.setItem = window.__originalSetItem;
-delete window.__originalSetItem;
+window.originalFetch=window.fetch;
+window.fetch=async function(path,options){if(String(path).endsWith('/answer')) throw new Error('保存失敗の検証'); return window.originalFetch.call(this,path,options);};
 JS
 ab click '#confirm' >/dev/null
+ab wait --fn "document.querySelector('#error').hidden === false && document.querySelector('#confirm').disabled === false" >/dev/null
 js <<'JS'
-assert(document.querySelector('#pending-count').textContent === '2', '確定後に件数を更新');
-assert(document.querySelector('#detail h2').textContent === '段階的な公開の範囲を決める', '次の未判断へ移動');
-assert(document.activeElement.id === 'detail', '次の判断票へフォーカス移動');
-const saved = JSON.parse(localStorage.getItem('decision-inbox-demo:v1'));
-assert(saved.review.choice === 'minimal' && saved.review.status === '処理待ち', '判断と後続処理を分離');
+assert(document.querySelector('#memo').value==='入力中のメモ <保持>','保存失敗時にメモを保持');
+assert(document.querySelector('#pending-count').textContent==='2','保存失敗を確定扱いにしない');
+window.fetch=window.originalFetch;
+const state=JSON.parse(window.name);
+const r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.request)});
+assert(r.ok,'新着を登録');
+return '合格：保存失敗時の入力維持';
 JS
-ab reload >/dev/null
-ab wait '#detail' >/dev/null
-ab click '[data-view="done"]' >/dev/null
-ab click '[data-case="review"]' >/dev/null
+ab wait --fn "document.querySelector('#pending-count').textContent === '3'" >/dev/null
 js <<'JS'
-const detail = document.querySelector('#detail');
-assert(detail.textContent.includes('検証用メモ <安全に表示>'), '再読み込み後も回答とメモを保持');
-assert(detail.querySelector('time'), '判断時刻を表示');
-assert(detail.textContent.includes('処理待ち'), '後続処理の状態を表示');
-assert(document.querySelector('#case-list [data-case]').dataset.case === 'review', '判断済みも優先度順');
+assert(document.querySelector('#detail h2').textContent==='緊急の判断','新着時に案件を入れ替えない');
+assert(document.querySelector('#memo').value==='入力中のメモ <保持>' && document.querySelector('input[value="a"]').checked,'更新時の候補とメモを保持');
+return '合格：新着と入力中の案件を同時に保持';
 JS
-ab click '[data-view="pending"]' >/dev/null
-ab select '#priority' later >/dev/null
+ab click '#confirm' >/dev/null
+ab wait --fn "document.querySelector('#pending-count').textContent === '2'" >/dev/null
 js <<'JS'
-assert(document.querySelectorAll('#case-list li').length === 1, '優先度で絞り込み');
-assert(document.querySelector('#detail h2').textContent === '導入ガイドの見せ方を選ぶ', '絞り込んだ案件の表示');
+assert(document.querySelector('#detail h2').textContent==='新着の判断','確定後は次件へ');
+assert(document.activeElement.id==='detail','次件の判断票にフォーカス');
+return '合格：確定・次件・フォーカス';
+JS
+ab click '#defer' >/dev/null
+ab select '#priority' normal >/dev/null
+js <<'JS'
+assert(document.querySelector('#detail h2').textContent==='通常の判断','あとで判断する操作');
+assert(document.querySelectorAll('#case-list li').length===1 && document.querySelector('#pending-count').textContent==='2','優先度の絞り込みと保留件数');
+return '合格：保留・優先度の絞り込み';
 JS
 ab select '#priority' all >/dev/null
-ab click '[data-case="release"]' >/dev/null
-ab click '#defer' >/dev/null
-js <<'JS'
-assert(document.querySelector('#pending-count').textContent === '2', '保留で確定しない');
-assert(document.querySelector('#detail h2').textContent === '導入ガイドの見せ方を選ぶ', '保留後は次の案件を表示');
-window.confirm = () => true;
-JS
-ab click '#reset' >/dev/null
-js <<'JS'
-const backup = JSON.parse(window.name);
-assert(localStorage.getItem(backup.sentinel) === '保護対象', '初期化で他のキーを保護');
-assert(localStorage.getItem('decision-inbox-demo:v1') === null, 'デモ回答だけを初期化');
-assert(document.querySelector('#pending-count').textContent === '3', '初期状態に復帰');
-localStorage.setItem('decision-inbox-demo:v1', '{破損データ');
-JS
 ab reload >/dev/null
-ab wait '#confirm' >/dev/null
-ab check 'input[value="minimal"]' >/dev/null
+ab wait '[data-view="done"]' >/dev/null
+ab click '[data-view="done"]' >/dev/null
+ab wait '.result' >/dev/null
 js <<'JS'
-assert(!document.querySelector('#error').hidden, '破損データの読み込み失敗を通知');
-assert(document.querySelector('#confirm').disabled, '破損データの上書きを防止');
-assert(localStorage.getItem('decision-inbox-demo:v1') === '{破損データ', '破損データも勝手に消さない');
+assert(document.querySelector('.result').textContent.includes('入力中のメモ <保持>'),'reload 後の回答保持');
+assert(document.querySelector('#processing-status').textContent.includes('処理待ち'),'確定だけで完了にしない');
+assert(document.querySelector('.related a') && document.querySelector('.background-section'),'判断済みでも背景とリンクを表示');
+const claim=await fetch('/api/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker:'ui-self-check'})}).then(r=>r.json());
+assert(claim.decision.id===JSON.parse(window.name).urgent,'回答済みを claim');
+const r=await fetch('/api/decisions/'+claim.decision.id+'/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:claim.token})});
+assert(r.ok,'後続処理を完了');
+return '合格：永続回答・判断済み表示・後続処理';
+JS
+ab wait --fn "document.querySelector('#processing-status').textContent.includes('完了')" >/dev/null
+ab click '[data-view="pending"]' >/dev/null
+ab check 'input[value="a"]' >/dev/null
+ab fill '#memo' '競合時にも保持するメモ' >/dev/null
+js <<'JS'
+const id=document.querySelector('[aria-current="true"]').dataset.case;
+const r=await fetch('/api/decisions/'+id+'/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice:'b',memo:'別の画面で判断'})});
+assert(r.ok,'別 client から先に確定');
+JS
+ab click '#confirm' >/dev/null
+ab wait --fn "document.querySelector('#error').textContent.includes('すでに判断') && document.querySelector('#confirm').disabled === false" >/dev/null
+js <<'JS'
+assert(document.querySelector('#memo').value==='競合時にも保持するメモ' && document.querySelector('input[value="a"]').checked,'409 で入力を保持');
+return '合格：二重判断の競合通知と入力保持';
 JS
 ab set viewport 390 844 >/dev/null
 js <<'JS'
-assert(document.documentElement.scrollWidth <= innerWidth, 'モバイルで横にはみ出さない');
-const list = document.querySelector('.inbox').getBoundingClientRect();
-const detail = document.querySelector('#detail').getBoundingClientRect();
-assert(detail.top >= list.bottom - 1, 'モバイルで 1 列に配置');
+assert(document.documentElement.scrollWidth<=innerWidth,'モバイルで横にはみ出さない');
+const list=document.querySelector('.inbox').getBoundingClientRect();
+assert(document.querySelector('#detail').getBoundingClientRect().top>=list.bottom-1,'モバイルの 1 列配置');
+assert(!document.querySelector('#reset'),'実データを削除するボタンなし');
+return '合格：処理状態の定期更新・モバイル・削除操作なし';
 JS
-printf '%s\n' '合格：候補・保存失敗・確定・フォーカス・再読込・優先度・保留・初期化・破損データ保護・モバイル'
+printf '%s\n' '合格：API 接続の UI self-check 全項目'
