@@ -145,12 +145,15 @@ class Desk:
 
     def select(self, item):
         self.item, self.scroll = item, 0
-        self.drafts.setdefault(item['id'], {'choice': None, 'memo': ''})
+        if item['answer'] is None:
+            self.drafts.setdefault(item['id'], {'choice': item['options'][0]['id'], 'memo': ''})
 
     def draft(self):
         if not self.item:
             return {'choice': None, 'memo': ''}
-        return self.drafts.setdefault(self.item['id'], {'choice': None, 'memo': ''})
+        if self.item['answer'] is not None:
+            return self.drafts.get(self.item['id'], {'choice': None, 'memo': ''})
+        return self.drafts.setdefault(self.item['id'], {'choice': self.item['options'][0]['id'], 'memo': ''})
 
     def move_case(self, direction):
         items = self.visible()
@@ -213,11 +216,12 @@ class Desk:
         self.item, self.scroll = None, 0
         if items:
             self.select(items[0])
-            self.draft()['choice'] = None
         self.notice = '回答を保存しました。依頼元の処理を待っています'
+        return True
 
     def dirty(self):
-        return any(draft['choice'] or draft['memo'] for draft in self.drafts.values())
+        defaults = {item['id']: item['options'][0]['id'] for item in self.items}
+        return any(draft['memo'] or draft['choice'] not in (None, defaults.get(identifier)) for identifier, draft in self.drafts.items())
 
     def links(self):
         if not self.item:
@@ -414,7 +418,12 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
     elif isinstance(key, str) and key in '12345678':
         desk.choose(number=int(key) - 1)
     elif key in ('\n', '\r', curses.KEY_ENTER):
-        desk.save()
+        if desk.save():
+            try:
+                # 同時に届いた Enter を次の案件の回答に使わない
+                curses.flushinp()
+            except curses.error:
+                pass
     elif key == '\t':
         desk.change_view()
     elif key == 'f':

@@ -49,28 +49,65 @@ class TuiTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.db = Path(self.directory.name) / 'tui.sqlite3'
         self.store = Store(self.db)
-        self.first = self.store.add(request_payload(title='最初の判断'))
+        self.first = self.store.add(request_payload(title='最初の判断', recommended='refactor'))
         self.second = self.store.add(request_payload(title='次の判断'))
         self.desk = Desk(self.store, 'http://127.0.0.1:4317/')
 
-    def test_arrow_selection_enter_save_and_no_repeat(self):
-        handle_key(self.desk, '\r')
-        self.assertIsNone(self.store.get(self.first['id'])['answer'])
-        handle_key(self.desk, curses.KEY_DOWN)
+    def test_first_choice_is_selected_without_saving_and_arrows_change_it(self):
         self.assertEqual(self.desk.draft()['choice'], 'minimal')
+        self.assertNotEqual(self.desk.draft()['choice'], self.first['recommended'])
+        self.assertIsNone(self.store.get(self.first['id'])['answer'])
+        lines, _ = detail_lines(self.desk, 100)
+        options = [line for line, _ in lines if line.startswith(('1.', '2.'))]
+        self.assertTrue(options[0].startswith('1. ●'))
+        self.assertNotIn('●', options[1])
+        self.assertFalse(self.desk.dirty())
         handle_key(self.desk, curses.KEY_DOWN)
         self.assertEqual(self.desk.draft()['choice'], 'refactor')
         handle_key(self.desk, curses.KEY_UP)
+        self.assertEqual(self.desk.draft()['choice'], 'minimal')
         handle_key(self.desk, '\r')
         self.assertEqual(self.store.get(self.first['id'])['answer']['choice'], 'minimal')
         self.assertEqual(self.store.get(self.first['id'])['answer']['status'], 'pending')
         self.assertEqual(self.desk.item['id'], self.second['id'])
-        self.assertIsNone(self.desk.draft()['choice'])
+        self.assertEqual(self.desk.draft()['choice'], 'minimal')
+        self.assertIsNone(self.store.get(self.second['id'])['answer'])
         handle_key(self.desk, '\r')
+        self.assertEqual(self.store.get(self.second['id'])['answer']['choice'], 'minimal')
+
+    def test_default_enter_saves_and_only_success_flushes_buffered_input(self):
+        with patch('cue_tui.curses.flushinp') as flush:
+            handle_key(self.desk, '\r')
+            flush.assert_called_once_with()
+        with patch('cue_tui.curses.flushinp') as flush, patch.object(self.store, 'answer', side_effect=sqlite3.OperationalError('保存失敗')):
+            handle_key(self.desk, '\r')
+            flush.assert_not_called()
+        self.assertEqual(self.desk.draft()['choice'], 'minimal')
         self.assertIsNone(self.store.get(self.second['id'])['answer'])
 
-    def test_refresh_preserves_case_draft_and_scroll_with_new_urgent(self):
+    def test_next_case_keeps_an_existing_choice_and_memo_draft(self):
+        handle_key(self.desk, curses.KEY_RIGHT)
         handle_key(self.desk, curses.KEY_DOWN)
+        self.desk.draft()['memo'] = '次の案件の下書き'
+        handle_key(self.desk, curses.KEY_LEFT)
+        handle_key(self.desk, '\r')
+        self.assertEqual(self.desk.item['id'], self.second['id'])
+        self.assertEqual(self.desk.draft(), {'choice': 'refactor', 'memo': '次の案件の下書き'})
+        self.assertIsNone(self.store.get(self.second['id'])['answer'])
+
+    def test_answered_view_uses_saved_choice_without_new_draft(self):
+        self.store.answer(self.first['id'], {'choice': 'refactor', 'memo': '保存済み'})
+        desk = Desk(self.store)
+        desk.change_view()
+        self.assertEqual(desk.item['id'], self.first['id'])
+        self.assertNotIn(self.first['id'], desk.drafts)
+        lines, _ = detail_lines(desk, 100)
+        options = [line for line, _ in lines if line.startswith(('1.', '2.'))]
+        self.assertNotIn('●', options[0])
+        self.assertTrue(options[1].startswith('2. ●'))
+        self.assertFalse(desk.dirty())
+
+    def test_refresh_preserves_case_draft_and_scroll_with_new_urgent(self):
         self.desk.draft()['memo'] = '入力中の日本語'
         self.desk.scroll = 12
         urgent = self.store.add(request_payload(title='新着', priority='urgent'))
@@ -81,7 +118,6 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(self.desk.scroll, 12)
 
     def test_conflict_and_write_failure_preserve_draft(self):
-        handle_key(self.desk, curses.KEY_DOWN)
         self.desk.draft()['memo'] = '保存前のメモ'
         with patch.object(self.store, 'answer', side_effect=sqlite3.OperationalError('書き込み失敗')):
             handle_key(self.desk, '\r')
@@ -99,11 +135,13 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(self.store.get(self.first['id'])['answer']['choice'], 'refactor')
 
     def test_case_navigation_views_and_priority(self):
+        handle_key(self.desk, curses.KEY_DOWN)
         self.desk.draft()['memo'] = '下書き'
         handle_key(self.desk, curses.KEY_RIGHT)
         self.assertEqual(self.desk.item['id'], self.second['id'])
         handle_key(self.desk, curses.KEY_LEFT)
         self.assertEqual(self.desk.draft()['memo'], '下書き')
+        self.assertEqual(self.desk.draft()['choice'], 'refactor')
         self.store.answer(self.first['id'], {'choice': 'minimal'})
         handle_key(self.desk, '\t')
         self.assertEqual(self.desk.view, 'done')
@@ -270,6 +308,7 @@ class TuiTests(unittest.TestCase):
                     os.close(slave)
 
     def test_pty_arrows_editor_resize_and_terminal_restore(self):
+        third = self.store.add(request_payload(title='最後の判断'))
         editor = Path(self.directory.name) / 'editor.py'
         editor.write_text("import pathlib,sys\npathlib.Path(sys.argv[1]).write_text('端末からのメモ', encoding='utf-8')\n")
         master, slave = os.openpty()
@@ -301,12 +340,16 @@ class TuiTests(unittest.TestCase):
             os.kill(process.pid, signal.SIGWINCH)
             os.write(master, b'\x1bOBm')
             pump_until(lambda: 'メモを下書きに反映'.encode() in output)
-            os.write(master, b'\r')
+            os.write(master, b'\r\r')
             pump_until(lambda: self.store.get(self.first['id'])['answer'] is not None)
             self.assertEqual(self.store.get(self.first['id'])['answer']['memo'], '端末からのメモ')
-            os.write(master, b'\r')
-            pump_until(lambda: '候補を選択してから'.encode() in output)
+            pump_until(lambda: '回答を保存しました'.encode() in output)
+            settled = time.monotonic()
+            pump_until(lambda: time.monotonic() - settled >= 0.2)
             self.assertIsNone(self.store.get(self.second['id'])['answer'])
+            os.write(master, b'\r')
+            pump_until(lambda: self.store.get(self.second['id'])['answer'] is not None)
+            self.assertEqual(self.store.get(self.second['id'])['answer']['choice'], 'minimal')
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 26, 110, 0, 0))
             os.kill(process.pid, signal.SIGWINCH)
             os.write(master, b'\x1bOBq')
@@ -319,7 +362,7 @@ class TuiTests(unittest.TestCase):
             after[3] &= ~getattr(termios, 'PENDIN', 0)
             before[3] &= ~getattr(termios, 'PENDIN', 0)
             self.assertEqual(after, before)
-            self.assertIsNone(self.store.get(self.second['id'])['answer'])
+            self.assertIsNone(self.store.get(third['id'])['answer'])
         finally:
             if process.poll() is None:
                 process.kill()
