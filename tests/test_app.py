@@ -268,6 +268,40 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn(item['id'], [value['id'] for value in data['decisions']])
         self.assertEqual(Store(self.db).list(), [item])
 
+    def test_http_recovery_and_idempotent_registration(self):
+        payload = request_payload(request_key='http-recovery/1')
+        status, item, _ = self.request('POST', '/api/decisions', payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(self.request('POST', '/api/decisions', payload)[1]['id'], item['id'])
+        self.assertEqual(self.request('POST', '/api/decisions', {**payload, 'title': '異なる依頼'})[0], 409)
+        path = '/api/decisions/' + item['id']
+        _, answered, _ = self.request('POST', path + '/answer', {'choice': 'minimal'})
+        self.assertTrue(answered['answer']['can_undo'])
+        self.assertEqual(self.request('POST', path + '/undo', {})[0], 400)
+        status, undone, _ = self.request('POST', path + '/undo', {'decided_at': answered['answer']['decided_at']})
+        self.assertEqual(status, 200)
+        self.assertIsNone(undone['answer'])
+        self.request('POST', path + '/answer', {'choice': 'refactor'})
+        _, claim, _ = self.request('POST', '/api/claim', {'worker': 'http-recovery'})
+        self.assertEqual(self.request('POST', path + '/renew', {'token': 'old-token'})[0], 409)
+        status, renewed, _ = self.request('POST', path + '/renew', {'token': claim['token'], 'lease_seconds': 3600})
+        self.assertEqual(status, 200)
+        self.assertIn('expires_at', renewed)
+        status, stopped, _ = self.request('POST', path + '/report', {'token': claim['token'], 'status': 'blocked', 'reason': '承認が必要', 'next_step': '承認後に再試行'})
+        self.assertEqual(status, 200)
+        self.assertFalse(stopped['answer']['can_undo'])
+        self.assertEqual(stopped['answer']['reason'], '承認が必要')
+        self.assertIsNone(self.request('POST', '/api/claim', {'worker': 'other'})[1]['decision'])
+        self.assertNotIn('token', json.dumps(self.request('GET', '/api/decisions')[1]))
+        retry = {key: stopped['answer'][key] for key in ('decided_at', 'reported_at')}
+        self.assertEqual(self.request('POST', path + '/retry', {**retry, 'reported_at': '古い報告'})[0], 409)
+        self.assertEqual(self.request('POST', path + '/retry', retry)[1]['answer']['status'], 'pending')
+        _, new_claim, _ = self.request('POST', '/api/claim', {'worker': 'http-recovery'})
+        self.assertEqual(self.request('POST', path + '/complete', {'token': claim['token']})[0], 409)
+        self.assertEqual(self.request('POST', path + '/complete', {'token': new_claim['token']})[0], 200)
+        self.assertEqual(self.request('POST', path + '/retry', retry)[0], 409)
+        self.assertEqual(self.request('POST', path + '/undo', {'decided_at': stopped['answer']['decided_at']})[0], 409)
+
     def test_cli_uses_same_database(self):
         fixture = Path(self.temp.name) / 'request.json'
         fixture.write_text(json.dumps(request_payload()), encoding='utf-8')

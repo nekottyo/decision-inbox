@@ -2,7 +2,7 @@
 """Local decision inbox, using only the Python standard library."""
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -62,7 +62,7 @@ def url(value, image=False):
 
 
 def validate_request(payload):
-    object_fields(payload, ('title', 'source', 'reason', 'options', 'recommended', 'recommendation'), ('background', 'priority', 'urgency_reason', 'deadline', 'links', 'image'))
+    object_fields(payload, ('title', 'source', 'reason', 'options', 'recommended', 'recommendation'), ('background', 'priority', 'urgency_reason', 'deadline', 'links', 'image', 'request_key'))
     item = {key: text(payload[key], key, maximum) for key, maximum in [('title', 200), ('source', 200), ('reason', 4000), ('recommendation', 4000)]}
     for key, maximum in [('background', 12000), ('urgency_reason', 2000)]:
         item[key] = text(payload.get(key, ''), key, maximum, empty=True)
@@ -110,6 +110,10 @@ def validate_request(payload):
         object_fields(image, ('url', 'alt'))
         image = {'url': url(image['url'], image=True), 'alt': text(image['alt'], '画像の説明', 1000)}
     item['image'] = image
+    if 'request_key' in payload:
+        item['request_key'] = text(payload['request_key'], 'request_key', 200)
+        if not re.fullmatch(r'[A-Za-z0-9_.:/-]+', item['request_key']):
+            raise AppError(400, 'request_key は英数字と _ . : / - で指定してください')
     if len(json.dumps(item, ensure_ascii=False).encode()) > MAX_BODY:
         raise AppError(413, '依頼のサイズが上限を超えています')
     return item
@@ -131,6 +135,22 @@ def parse_json(raw):
         raise AppError(400, '有効な JSON を指定してください') from None
 
 
+SCHEMA = '''CREATE TABLE decisions (
+    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL,
+    choice TEXT, memo TEXT, decided_at TEXT,
+    status TEXT CHECK(status IN ('pending','processing','completed','blocked','failed')),
+    worker TEXT, token TEXT, lease_until REAL, request_key TEXT UNIQUE,
+    reason TEXT NOT NULL DEFAULT '', next_step TEXT NOT NULL DEFAULT '', reported_at TEXT,
+    CHECK((choice IS NULL AND status IS NULL) OR (choice IS NOT NULL AND status IS NOT NULL)))'''
+LEGACY_COLUMNS = 'id,created_at,payload,choice,memo,decided_at,status,worker,token,lease_until'
+
+
+def validate_lease(seconds):
+    if type(seconds) is not int or not 1 <= seconds <= 3600:
+        raise AppError(400, 'lease_seconds は 1〜3600 の整数を指定してください')
+    return seconds
+
+
 class Store:
     def __init__(self, path, readonly=False):
         self.path = str(path)
@@ -147,12 +167,28 @@ class Store:
         else:
             os.close(descriptor)
         with self.db() as connection:
-            connection.execute('''CREATE TABLE IF NOT EXISTS decisions (
-                id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL,
-                choice TEXT, memo TEXT, decided_at TEXT,
-                status TEXT CHECK(status IN ('pending','processing','completed')),
-                worker TEXT, token TEXT, lease_until REAL,
-                CHECK((choice IS NULL AND status IS NULL) OR (choice IS NOT NULL AND status IS NOT NULL)))''')
+            connection.execute('BEGIN IMMEDIATE')
+            version = connection.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0, 1, 2):
+                raise AppError(500, '未対応の DB バージョンです')
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='decisions'").fetchone()
+            if not exists:
+                connection.execute(SCHEMA)
+            else:
+                columns = {row['name'] for row in connection.execute('PRAGMA table_info(decisions)')}
+                if columns == set(LEGACY_COLUMNS.split(',')):
+                    self.backup(self.path + '.pre-v2-' + uuid.uuid4().hex + '.sqlite3')
+                    connection.execute('ALTER TABLE decisions RENAME TO decisions_legacy')
+                    connection.execute(SCHEMA)
+                    connection.execute(f'INSERT INTO decisions({LEGACY_COLUMNS}) SELECT {LEGACY_COLUMNS} FROM decisions_legacy')
+                    connection.execute('DROP TABLE decisions_legacy')
+                elif columns != set(LEGACY_COLUMNS.split(',')) | {'request_key', 'reason', 'next_step', 'reported_at'}:
+                    raise AppError(500, '未対応の DB 形式です')
+            connection.execute('''CREATE TABLE IF NOT EXISTS answer_history (
+                id INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, event TEXT NOT NULL,
+                recorded_at TEXT NOT NULL, answer TEXT NOT NULL)''')
+            if version != 2:
+                connection.execute('PRAGMA user_version=2')
 
     @contextmanager
     def db(self):
@@ -165,20 +201,86 @@ class Store:
         finally:
             connection.close()
 
+    def backup(self, output):
+        output = Path(output).expanduser().absolute()
+        if output.resolve() == Path(self.path).resolve() or output.exists() or output.is_symlink():
+            raise AppError(409, 'バックアップ先は既存ファイルや元 DB と別のパスを指定してください')
+        descriptor, temporary = tempfile.mkstemp(prefix='.cue-backup-', dir=output.parent)
+        os.close(descriptor)
+        try:
+            source = sqlite3.connect(Path(self.path).resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
+            try:
+                destination = sqlite3.connect(temporary)
+                try:
+                    source.backup(destination)
+                    # 単一ファイルで復元できるよう、コピー元の WAL 設定を持ち込まない。
+                    destination.execute('PRAGMA journal_mode=DELETE')
+                    if destination.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                        raise AppError(500, 'バックアップの整合性を確認できませんでした')
+                finally:
+                    destination.close()
+            finally:
+                source.close()
+            with open(temporary, 'rb') as handle:
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, output)
+            except FileExistsError:
+                raise AppError(409, 'バックアップ先が既に存在します') from None
+        finally:
+            for suffix in ('', '-wal', '-shm', '-journal'):
+                try:
+                    os.unlink(temporary + suffix)
+                except FileNotFoundError:
+                    pass
+        return {'backup': str(output)}
+
     def public(self, row):
         if row is None:
             raise AppError(404, '案件が見つかりません')
         item = json.loads(row['payload'])
         item.update(id=row['id'], created_at=row['created_at'], answer=None)
         if row['choice'] is not None:
-            item['answer'] = {'choice': row['choice'], 'memo': row['memo'], 'decided_at': row['decided_at'], 'status': row['status']}
+            item['answer'] = {
+                'choice': row['choice'], 'memo': row['memo'], 'decided_at': row['decided_at'], 'status': row['status'],
+                'reason': row['reason'], 'next_step': row['next_step'], 'reported_at': row['reported_at'],
+                'can_undo': row['status'] == 'pending' and row['worker'] is None and row['token'] is None and row['lease_until'] is None,
+            }
         return item
+
+    def stamp(self, connection, identifier, previous=''):
+        latest = connection.execute('SELECT MAX(recorded_at) FROM answer_history WHERE decision_id=?', (identifier,)).fetchone()[0]
+        previous = max(previous, latest or '')
+        current = utc_now()
+        if current <= previous:
+            current = (datetime.fromisoformat(previous) + timedelta(microseconds=1)).isoformat(timespec='microseconds')
+        return current
+
+    def record(self, connection, row, event):
+        connection.execute('INSERT INTO answer_history(decision_id,event,recorded_at,answer) VALUES(?,?,?,?)',
+                           (row['id'], event, self.stamp(connection, row['id'], max(row['decided_at'] or '', row['reported_at'] or '')), json.dumps(self.public(row)['answer'], ensure_ascii=False)))
+
+    def active(self, row, token):
+        self.public(row)
+        text(token, 'token', 200)
+        now = time.time()
+        if not token.isascii() or row['status'] != 'processing' or not row['token'] or not secrets.compare_digest(row['token'], token) or row['lease_until'] is None or row['lease_until'] <= now:
+            raise AppError(409, 'claim token が無効または期限切れです')
+        return now
 
     def add(self, payload):
         item = validate_request(payload)
+        canonical = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         identifier = uuid.uuid4().hex
         with self.db() as connection:
-            connection.execute('INSERT INTO decisions(id,created_at,payload) VALUES(?,?,?)', (identifier, utc_now(), json.dumps(item, ensure_ascii=False)))
+            connection.execute('BEGIN IMMEDIATE')
+            if 'request_key' in item:
+                row = connection.execute('SELECT * FROM decisions WHERE request_key=?', (item['request_key'],)).fetchone()
+                if row:
+                    if json.dumps(json.loads(row['payload']), ensure_ascii=False, sort_keys=True, separators=(',', ':')) != canonical:
+                        raise AppError(409, '同じ request_key に異なる依頼が登録されています')
+                    return self.public(row)
+            connection.execute('INSERT INTO decisions(id,created_at,payload,request_key) VALUES(?,?,?,?)', (identifier, utc_now(), canonical, item.get('request_key')))
         return self.get(identifier)
 
     def list(self):
@@ -205,13 +307,25 @@ class Store:
                 raise AppError(409, '別の画面で判断済みです。入力は保存していません')
             if choice not in {option['id'] for option in item['options']}:
                 raise AppError(400, '選択した候補が見つかりません')
-            connection.execute("UPDATE decisions SET choice=?,memo=?,decided_at=?,status='pending' WHERE id=? AND choice IS NULL", (choice, memo, utc_now(), identifier))
+            connection.execute("UPDATE decisions SET choice=?,memo=?,decided_at=?,status='pending' WHERE id=? AND choice IS NULL", (choice, memo, self.stamp(connection, identifier), identifier))
+        return self.get(identifier)
+
+    def undo(self, identifier, payload):
+        object_fields(payload, ('decided_at',))
+        expected = text(payload['decided_at'], 'decided_at', 64)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+            answer = self.public(row)['answer']
+            if not answer or not answer['can_undo'] or row['decided_at'] != expected:
+                raise AppError(409, '回答が変更済み、または処理開始済みのため取り消せません')
+            self.record(connection, row, 'undo')
+            connection.execute('UPDATE decisions SET choice=NULL,memo=NULL,decided_at=NULL,status=NULL WHERE id=?', (identifier,))
         return self.get(identifier)
 
     def claim(self, worker, lease_seconds=300):
         text(worker, 'worker', 200)
-        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
-            raise AppError(400, 'lease_seconds は 1〜3600 の整数を指定してください')
+        validate_lease(lease_seconds)
         token = secrets.token_urlsafe(32)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -224,19 +338,54 @@ class Store:
             decision = self.public(connection.execute('SELECT * FROM decisions WHERE id=?', (row['id'],)).fetchone())
         return {'decision': decision, 'token': token, 'worker': worker, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
 
-    def complete(self, identifier, token):
-        text(token, 'token', 200)
-        if not token.isascii():
-            raise AppError(409, 'claim token が無効です')
+    def report(self, identifier, payload):
+        object_fields(payload, ('token', 'status', 'reason', 'next_step'))
+        if payload['status'] not in ('blocked', 'failed'):
+            raise AppError(400, '報告状態は blocked または failed を指定してください')
+        reason = text(payload['reason'], 'reason', 4000)
+        next_step = text(payload['next_step'], 'next_step', 4000)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+            self.active(row, payload['token'])
+            connection.execute('UPDATE decisions SET status=?,reason=?,next_step=?,reported_at=?,token=NULL,lease_until=NULL WHERE id=?',
+                               (payload['status'], reason, next_step, self.stamp(connection, identifier), identifier))
+            self.record(connection, connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone(), 'report')
+        return self.get(identifier)
+
+    def retry(self, identifier, payload):
+        object_fields(payload, ('decided_at', 'reported_at'))
+        decided_at = text(payload['decided_at'], 'decided_at', 64)
+        reported_at = text(payload['reported_at'], 'reported_at', 64)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
             self.public(row)
-            if row['status'] != 'processing' or not row['token'] or not secrets.compare_digest(row['token'], token) or row['lease_until'] <= time.time():
-                raise AppError(409, 'claim token が無効または期限切れです')
-            connection.execute("UPDATE decisions SET status='completed',token=NULL,lease_until=NULL WHERE id=?", (identifier,))
+            if row['status'] not in ('blocked', 'failed') or row['decided_at'] != decided_at or row['reported_at'] != reported_at:
+                raise AppError(409, '停止理由が変更済み、または再試行できない状態です')
+            self.record(connection, row, 'retry')
+            connection.execute("UPDATE decisions SET status='pending',reason='',next_step='',reported_at=NULL WHERE id=?", (identifier,))
         return self.get(identifier)
 
+    def renew(self, identifier, payload):
+        object_fields(payload, ('token',), ('lease_seconds',))
+        seconds = validate_lease(payload.get('lease_seconds', 300))
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+            now = self.active(row, payload['token'])
+            expires = max(row['lease_until'], now + seconds)
+            connection.execute('UPDATE decisions SET lease_until=? WHERE id=?', (expires, identifier))
+            decision = self.public(connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone())
+        return {'decision': decision, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
+
+    def complete(self, identifier, token):
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+            self.active(row, token)
+            connection.execute("UPDATE decisions SET status='completed',token=NULL,lease_until=NULL WHERE id=?", (identifier,))
+        return self.get(identifier)
 
 def seed_demo(store):
     names = [
@@ -346,12 +495,14 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/claim':
                     object_fields(payload, ('worker',), ('lease_seconds',))
                     return self.json_response(200, store.claim(payload['worker'], payload.get('lease_seconds', 300)))
-                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete)', path)
+                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|renew)', path)
                 if match:
-                    if match[2] == 'answer':
-                        return self.json_response(200, store.answer(match[1], payload))
-                    object_fields(payload, ('token',))
-                    return self.json_response(200, store.complete(match[1], payload['token']))
+                    if match[2] == 'complete':
+                        object_fields(payload, ('token',))
+                        result = store.complete(match[1], payload['token'])
+                    else:
+                        result = getattr(store, match[2])(match[1], payload)
+                    return self.json_response(200, result)
             raise AppError(404, '見つかりません')
         except AppError as error:
             self.json_response(error.status, {'error': str(error)})
@@ -448,6 +599,25 @@ def main(argv=None):
     complete = commands.add_parser('complete')
     complete.add_argument('--id', required=True)
     complete.add_argument('--token', required=True)
+    undo = commands.add_parser('undo')
+    undo.add_argument('--id', required=True)
+    undo.add_argument('--decided-at', required=True)
+    report = commands.add_parser('report')
+    report.add_argument('--id', required=True)
+    report.add_argument('--token', required=True)
+    report.add_argument('--status', choices=('blocked', 'failed'), required=True)
+    report.add_argument('--reason', required=True)
+    report.add_argument('--next-step', required=True)
+    retry = commands.add_parser('retry')
+    retry.add_argument('--id', required=True)
+    retry.add_argument('--decided-at', required=True)
+    retry.add_argument('--reported-at', required=True)
+    renew = commands.add_parser('renew')
+    renew.add_argument('--id', required=True)
+    renew.add_argument('--token', required=True)
+    renew.add_argument('--lease-seconds', type=int, default=300)
+    backup = commands.add_parser('backup')
+    backup.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == 'tui':
@@ -469,7 +639,7 @@ def main(argv=None):
                 except KeyboardInterrupt:
                     pass
             return 0
-        store = Store(args.db, readonly=args.command == 'watch')
+        store = Store(args.db, readonly=args.command in ('watch', 'backup'))
         if args.command == 'watch':
             return watch_ready(store, args.interval, args.timeout)
         if args.command == 'add':
@@ -482,6 +652,16 @@ def main(argv=None):
             result = {'decisions': store.list(), 'demo': False}
         elif args.command == 'claim':
             result = store.claim(args.worker, args.lease_seconds)
+        elif args.command == 'undo':
+            result = store.undo(args.id, {'decided_at': args.decided_at})
+        elif args.command == 'report':
+            result = store.report(args.id, {'token': args.token, 'status': args.status, 'reason': args.reason, 'next_step': args.next_step})
+        elif args.command == 'retry':
+            result = store.retry(args.id, {'decided_at': args.decided_at, 'reported_at': args.reported_at})
+        elif args.command == 'renew':
+            result = store.renew(args.id, {'token': args.token, 'lease_seconds': args.lease_seconds})
+        elif args.command == 'backup':
+            result = store.backup(args.output)
         else:
             result = store.complete(args.id, args.token)
         print(json.dumps(result, ensure_ascii=False))
