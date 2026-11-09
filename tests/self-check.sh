@@ -24,7 +24,7 @@ ab reload >/dev/null
 ab wait '#confirm' >/dev/null
 js <<'JS'
 assert(document.querySelector('#detail h2').textContent==='緊急の判断','緊急順');
-assert(document.querySelector('#confirm').disabled,'候補未選択では確定不可');
+assert(document.querySelector('#confirm').disabled || document.querySelector('#confirm').getAttribute('aria-disabled')==='true','候補未選択では確定不可');
 assert(document.querySelector('.background-section')?.textContent.includes('背景を最初から表示する <確認>'),'背景を初期表示して安全に描画');
 assert(!document.querySelector('.background-section details'),'背景を折り畳まない');
 const link=document.querySelector('.related a');
@@ -39,8 +39,9 @@ js <<'JS'
 window.originalFetch=window.fetch;
 window.fetch=async function(path,options){if(String(path).endsWith('/answer')) throw new Error('保存失敗の検証'); return window.originalFetch.call(this,path,options);};
 JS
+ab scrollintoview '#confirm' >/dev/null
 ab click '#confirm' >/dev/null
-ab wait --fn "document.querySelector('#error').hidden === false && document.querySelector('#confirm').disabled === false" >/dev/null
+ab wait --fn "document.querySelector('#error').hidden === false && !document.querySelector('#confirm').disabled && document.querySelector('#confirm').getAttribute('aria-disabled') !== 'true'" >/dev/null
 js <<'JS'
 assert(document.querySelector('#memo').value==='入力中のメモ <保持>','保存失敗時にメモを保持');
 assert(document.querySelector('#pending-count').textContent==='2','保存失敗を確定扱いにしない');
@@ -56,6 +57,7 @@ assert(document.querySelector('#detail h2').textContent==='緊急の判断','新
 assert(document.querySelector('#memo').value==='入力中のメモ <保持>' && document.querySelector('input[value="a"]').checked,'更新時の候補とメモを保持');
 return '合格：新着と入力中の案件を同時に保持';
 JS
+ab scrollintoview '#confirm' >/dev/null
 ab click '#confirm' >/dev/null
 ab wait --fn "document.querySelector('#pending-count').textContent === '2'" >/dev/null
 js <<'JS'
@@ -64,13 +66,15 @@ assert(document.activeElement.id==='detail','次件の判断票にフォーカ�
 return '合格：確定・次件・フォーカス';
 JS
 ab click '#defer' >/dev/null
-ab select '#priority' normal >/dev/null
+ab click '#priority' >/dev/null
+ab find role option click --name '通常' >/dev/null
 js <<'JS'
 assert(document.querySelector('#detail h2').textContent==='通常の判断','あとで判断する操作');
 assert(document.querySelectorAll('#case-list li').length===1 && document.querySelector('#pending-count').textContent==='2','優先度の絞り込みと保留件数');
 return '合格：保留・優先度の絞り込み';
 JS
-ab select '#priority' all >/dev/null
+ab click '#priority' >/dev/null
+ab find role option click --name 'すべて' >/dev/null
 ab reload >/dev/null
 ab wait '[data-view="done"]' >/dev/null
 ab click '[data-view="done"]' >/dev/null
@@ -90,12 +94,13 @@ ab click '[data-view="pending"]' >/dev/null
 ab check 'input[value="a"]' >/dev/null
 ab fill '#memo' '競合時にも保持するメモ' >/dev/null
 js <<'JS'
-const id=document.querySelector('[aria-current="true"]').dataset.case;
+const id=document.querySelector('#case-list [aria-current="true"]').dataset.case;
 const r=await fetch('/api/decisions/'+id+'/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice:'b',memo:'別の画面で判断'})});
 assert(r.ok,'別 client から先に確定');
 JS
+ab scrollintoview '#confirm' >/dev/null
 ab click '#confirm' >/dev/null
-ab wait --fn "document.querySelector('#error').textContent.includes('すでに判断') && document.querySelector('#confirm').disabled === false" >/dev/null
+ab wait --fn "document.querySelector('#error').textContent.includes('すでに判断') && !document.querySelector('#confirm').disabled && document.querySelector('#confirm').getAttribute('aria-disabled') !== 'true'" >/dev/null
 js <<'JS'
 assert(document.querySelector('#memo').value==='競合時にも保持するメモ' && document.querySelector('input[value="a"]').checked,'409 で入力を保持');
 return '合格：二重判断の競合通知と入力保持';

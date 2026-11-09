@@ -1,0 +1,170 @@
+import {useEffect, useLayoutEffect, useRef, useState} from 'react';
+import DecisionDesk from './DecisionDesk.jsx';
+
+const ranks = {urgent: 0, normal: 1, later: 2};
+const emptyDraft = () => ({choice: '', memo: ''});
+const visibleItems = (cases, view, priority) => cases
+  .filter(item => (view === 'done') === Boolean(item.answer))
+  .filter(item => priority === 'all' || item.priority === priority)
+  .sort((a, b) => ranks[a.priority] - ranks[b.priority] || Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
+
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {cache: 'no-store'} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const error = new Error(data.error || 'サーバーに接続できませんでした');
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+export default function App() {
+  const [state, setState] = useState({
+    cases: [], view: 'pending', priority: 'all', selectedItem: null,
+    draft: emptyDraft(), loading: true, saving: false, demo: false,
+    notice: '', error: '', errorKind: '',
+  });
+  const current = useRef(state);
+  current.current = state;
+  const drafts = useRef(new Map());
+  const saving = useRef(false);
+  const refreshing = useRef(false);
+  const version = useRef(0);
+  const focusDetail = useRef(false);
+  const detailRef = useRef(null);
+
+  useLayoutEffect(() => {
+    if (focusDetail.current) {
+      detailRef.current?.focus({preventScroll: true});
+      focusDetail.current = false;
+    }
+  });
+
+  useEffect(() => {
+    let active = true;
+    async function refresh() {
+      if (refreshing.current || saving.current) return;
+      refreshing.current = true;
+      const requestedVersion = version.current;
+      try {
+        const data = await api('/api/decisions');
+        if (!active || saving.current || requestedVersion !== version.current) return;
+        setState(previous => {
+          const changed = JSON.stringify(previous.cases) !== JSON.stringify(data.decisions);
+          let selectedItem = previous.selectedItem;
+          if (!selectedItem) {
+            selectedItem = visibleItems(data.decisions, previous.view, previous.priority)[0] || null;
+          } else if (selectedItem.answer) {
+            selectedItem = data.decisions.find(item => item.id === selectedItem.id) || selectedItem;
+          }
+          let notice = previous.notice;
+          if (!previous.loading && changed) {
+            const latest = data.decisions.find(item => item.id === selectedItem?.id);
+            notice = selectedItem && !selectedItem.answer && JSON.stringify(latest) !== JSON.stringify(selectedItem)
+              ? '表示中の案件に変更があります。入力を保持しています。一覧から案件を選び直すと最新の状態を確認できます。'
+              : '新着または処理状態の変更があります。一覧を更新しました。';
+          }
+          return {...previous, cases: data.decisions, selectedItem, loading: false, demo: data.demo, notice,
+            draft: selectedItem?.id === previous.selectedItem?.id ? previous.draft : drafts.current.get(selectedItem?.id) || emptyDraft(),
+            error: previous.errorKind === 'load' ? '' : previous.error,
+            errorKind: previous.errorKind === 'load' ? '' : previous.errorKind};
+        });
+      } catch {
+        if (active) setState(previous => ({...previous, loading: false, errorKind: 'load',
+          error: '案件を読み込めませんでした。表示中の内容と入力は保持しています。接続を確認してください。自動で再試行します。'}));
+      } finally { refreshing.current = false; }
+    }
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => { active = false; clearInterval(timer); };
+  }, []);
+
+  function select(id, focus = true) {
+    if (saving.current) return;
+    focusDetail.current = focus;
+    setState(previous => ({...previous,
+      selectedItem: previous.cases.find(item => item.id === id) || null,
+      draft: drafts.current.get(id) || emptyDraft(), error: '', errorKind: '',
+    }));
+  }
+
+  function changeView(view) {
+    if (saving.current) return;
+    focusDetail.current = true;
+    setState(previous => {
+      const selectedItem = visibleItems(previous.cases, view, previous.priority)[0] || null;
+      return {...previous, view, selectedItem, draft: drafts.current.get(selectedItem?.id) || emptyDraft(), error: '', errorKind: ''};
+    });
+  }
+
+  function changePriority(priority) {
+    if (saving.current) return;
+    setState(previous => {
+      const items = visibleItems(previous.cases, previous.view, priority);
+      const selectedItem = items.some(item => item.id === previous.selectedItem?.id) ? previous.selectedItem : items[0] || null;
+      return {...previous, priority, selectedItem,
+        draft: selectedItem?.id === previous.selectedItem?.id ? previous.draft : drafts.current.get(selectedItem?.id) || emptyDraft(),
+        notice: `${items.length} 件を表示しています。`};
+    });
+  }
+
+  function changeDraft(draft) {
+    if (saving.current) return;
+    drafts.current.set(current.current.selectedItem?.id, draft);
+    setState(previous => ({...previous, draft}));
+  }
+
+  function defer() {
+    if (saving.current) return;
+    focusDetail.current = true;
+    setState(previous => {
+      const items = visibleItems(previous.cases, previous.view, previous.priority);
+      const index = items.findIndex(item => item.id === previous.selectedItem?.id);
+      const selectedItem = items[(index + 1) % items.length] || null;
+      return {...previous, selectedItem, draft: drafts.current.get(selectedItem?.id) || emptyDraft(),
+        notice: `「${previous.selectedItem?.title}」は判断待ちに残しました。入力途中の内容は、このページを開いている間は保持されます。`};
+    });
+  }
+
+  async function submit() {
+    const {selectedItem, draft} = current.current;
+    if (saving.current || !selectedItem || selectedItem.answer || !draft.choice) return;
+    if (Array.from(draft.memo).length > 2000) {
+      setState(previous => ({...previous, errorKind: 'save', error: 'メモは 2,000 文字以内で入力してください。入力は保持しています。'}));
+      return;
+    }
+    saving.current = true;
+    version.current += 1;
+    setState(previous => ({...previous, saving: true, error: '', errorKind: ''}));
+    try {
+      const updated = await api(`/api/decisions/${encodeURIComponent(selectedItem.id)}/answer`, draft);
+      drafts.current.delete(updated.id);
+      focusDetail.current = true;
+      setState(previous => {
+        const cases = previous.cases.map(item => item.id === updated.id ? updated : item);
+        const nextItem = visibleItems(cases, previous.view, previous.priority)[0] || null;
+        return {...previous, cases, selectedItem: nextItem, draft: drafts.current.get(nextItem?.id) || emptyDraft(),
+          notice: `「${selectedItem.title}」の判断を保存しました。後続処理は「処理待ち」です。`};
+      });
+    } catch (error) {
+      setState(previous => ({...previous, errorKind: 'save', error: error.status === 409
+        ? 'この案件は別の画面ですでに判断されています。入力はこの画面に残しています。一覧から案件を選び直して、記録済みの判断を確認してください。'
+        : `判断を保存できませんでした。入力はこの画面に残っています。${error.message}。接続を確認して再試行してください。`}));
+    } finally {
+      saving.current = false;
+      setState(previous => ({...previous, saving: false}));
+    }
+  }
+
+  return <DecisionDesk
+    items={visibleItems(state.cases, state.view, state.priority)}
+    counts={{pending: state.cases.filter(item => !item.answer).length, done: state.cases.filter(item => item.answer).length}}
+    selectedItem={state.selectedItem} view={state.view} priority={state.priority} draft={state.draft}
+    loading={state.loading} saving={state.saving} demo={state.demo} notice={state.notice} error={state.error}
+    detailRef={detailRef} onViewChange={changeView} onPriorityChange={changePriority} onSelect={select}
+    onDraftChange={changeDraft} onSubmit={submit} onDefer={defer}
+  />;
+}

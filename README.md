@@ -1,8 +1,19 @@
-# 判断の受信箱
+# Cue
 
-判断依頼を受け取り、人が選んだ回答を処理キューへ渡すローカル Web アプリです。Python 3 標準ライブラリの HTTP server と SQLite、vanilla JS で動きます。外部依存・ビルド・特定の agent harness は不要です。
+判断依頼を受け取り、人が選んだ回答を処理キューへ渡すローカル Web アプリです。Python 3 標準ライブラリの HTTP server と SQLite、React と Astryx で動きます。特定の agent harness は不要です。Node.js は UI のビルド時だけ使用し、起動後の配信は Python が行います。
 
 ## 起動
+
+初回と UI の変更後に、フロントエンドをビルドします。
+
+```sh
+cd frontend
+npm ci
+npm run build
+cd ..
+```
+
+Astryx core / neutral theme は 0.7.5 に固定しています。依存はこの project 内だけに導入し、外部 CDN は使用しません。
 
 ```sh
 python3 app.py serve --port 4317
@@ -66,7 +77,7 @@ claim は回答日時順の FIFO で、有効期限付き token を返します�
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
-node --check app.js
+npm --prefix frontend run build
 bash -n tests/self-check.sh
 ```
 

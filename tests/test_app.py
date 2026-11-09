@@ -236,11 +236,26 @@ class HTTPTests(unittest.TestCase):
         for path in ['/.git/config', '/app.py', '/README.md', '/queue.sqlite3', '/../../app.py', '/%2e%2e/app.py', '/assets/%2e%2e/app.py']:
             with self.subTest(path=path):
                 self.assertEqual(self.request('GET', path)[0], 404)
-        for path in ['/', '/style.css', '/app.js']:
-            status, _, headers = self.request('GET', path)
-            self.assertEqual(status, 200)
-            self.assertNotIn('Access-Control-Allow-Origin', headers)
+        web_root = Path(self.temp.name) / 'ui'
+        (web_root / 'assets').mkdir(parents=True)
+        (web_root / 'index.html').write_text('<title>Cue</title>')
+        (web_root / 'assets/app.js').write_text('console.log("test")')
+        (web_root / 'assets/app.css').write_text('body {}')
+        with patch('app.WEB_ROOT', web_root):
+            for path in ['/', '/index.html', '/assets/app.css', '/assets/app.js', '/assets/demo-flow.svg']:
+                status, _, headers = self.request('GET', path)
+                self.assertEqual(status, 200)
+                self.assertNotIn('Access-Control-Allow-Origin', headers)
+            for path in ['/app.js', '/style.css', '/assets/unknown.js', '/frontend/package.json']:
+                self.assertEqual(self.request('GET', path)[0], 404)
         self.assertEqual(self.request('GET', '/api/decisions', headers={'Host': 'evil.example'})[0], 403)
+
+    def test_unbuilt_ui_has_setup_error_but_api_stays_available(self):
+        with patch('app.WEB_ROOT', Path(self.temp.name) / 'missing-ui'):
+            status, data, _ = self.request('GET', '/')
+            self.assertEqual(status, 503)
+            self.assertIn('npm ci && npm run build', data['error'])
+            self.assertEqual(self.request('GET', '/api/decisions')[0], 200)
 
     def test_demo_does_not_modify_real_database(self):
         self.stop()

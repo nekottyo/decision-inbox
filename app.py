@@ -19,7 +19,8 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 MAX_BODY = 131072
 ASSETS = {'/assets/demo-flow.svg': ('assets/demo-flow.svg', 'image/svg+xml')}
-STATIC = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8'), **ASSETS}
+WEB_ROOT = ROOT / 'frontend' / 'dist'
+STATIC = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/assets/app.js': ('assets/app.js', 'text/javascript; charset=utf-8'), '/assets/app.css': ('assets/app.css', 'text/css; charset=utf-8')}
 
 
 class AppError(Exception):
@@ -313,10 +314,16 @@ class Handler(BaseHTTPRequestHandler):
                 match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})', path)
                 if match:
                     return self.json_response(200, store.get(match[1]))
-                if path not in STATIC:
+                if path in ASSETS:
+                    filename, content_type = ASSETS[path]
+                    body = (ROOT / filename).read_bytes()
+                elif path in STATIC:
+                    filename, content_type = STATIC[path]
+                    if not (WEB_ROOT / 'index.html').is_file():
+                        raise AppError(503, 'UI が未ビルドです。frontend で npm ci && npm run build を実行してください')
+                    body = (WEB_ROOT / filename).read_bytes()
+                else:
                     raise AppError(404, '見つかりません')
-                filename, content_type = STATIC[path]
-                body = (ROOT / filename).read_bytes()
                 self.send_response(200)
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(body)))

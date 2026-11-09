@@ -1,0 +1,18 @@
+{
+  "name": "decision-inbox-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --entry-names=app --outdir=dist/assets && cp index.html dist/index.html"
+  },
+  "dependencies": {
+    "@astryxdesign/core": "0.7.5",
+    "@astryxdesign/theme-neutral": "0.7.5",
+    "@stylexjs/stylex": "0.19.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}
