@@ -14,7 +14,22 @@ import webbrowser
 PRIORITIES = {'urgent': 'すぐ判断', 'normal': '通常', 'later': 'あとでよい'}
 STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了', 'blocked': '承認・条件待ち', 'failed': '失敗'}
 FILTERS = ('all', 'urgent', 'normal', 'later')
+HEADING_COLORS = {'context': 117, 'options': 183, 'recommendation': 151, 'stopped': 221}
 BIDI = set('\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069')
+
+
+def heading_styles():
+    attributes = {name: curses.A_BOLD for name in HEADING_COLORS}
+    try:
+        if not curses.has_colors() or curses.COLORS < 256 or curses.COLOR_PAIRS <= len(HEADING_COLORS):
+            return attributes
+        curses.use_default_colors()
+        for pair, (name, color) in enumerate(HEADING_COLORS.items(), 1):
+            curses.init_pair(pair, color, -1)
+            attributes[name] |= curses.color_pair(pair)
+    except curses.error:
+        return {name: curses.A_BOLD for name in HEADING_COLORS}
+    return attributes
 
 
 def safe_text(value):
@@ -117,6 +132,7 @@ class Desk:
         self.notice, self.load_error = '', ''
         self.mode, self.menu_index = None, 0
         self.jump_choice = False
+        self.heading_styles = {}
         self.refresh()
 
     def visible(self):
@@ -286,15 +302,20 @@ def detail_lines(desk, columns):
     def append(value='', attribute=0):
         lines.extend((line, attribute) for line in wrap(value, columns))
 
+    def heading(value, kind):
+        append(value, desk.heading_styles.get(kind, curses.A_BOLD))
+
     append(item['title'], curses.A_BOLD)
     status = STATUSES.get(item['answer']['status'], '判断済み') if item['answer'] else '判断待ち'
     append(f"[{PRIORITIES[item['priority']]}] {status}")
     if item['answer']:
         answer = item['answer']
         if answer.get('reason'):
-            append(f"止まった理由: {answer['reason']}", curses.A_BOLD)
+            heading('止まった理由', 'stopped')
+            append(answer['reason'])
         if answer.get('next_step'):
-            append(f"再開に必要なこと: {answer['next_step']}")
+            heading('再開に必要なこと', 'stopped')
+            append(answer['next_step'])
         if answer.get('can_undo'):
             append('u: 回答を取り消す (処理開始前のみ)')
         elif answer['status'] in ('blocked', 'failed'):
@@ -309,7 +330,7 @@ def detail_lines(desk, columns):
     for label, key in [('判断が必要な理由', 'reason'), ('背景', 'background')]:
         if item.get(key):
             append()
-            append(label, curses.A_BOLD)
+            heading(label, 'context')
             append(item[key])
     if item.get('image'):
         append()
@@ -321,10 +342,10 @@ def detail_lines(desk, columns):
         for label, target in desk.links():
             append(f'{label}: {target}')
     append()
-    append('依頼元の推奨', curses.A_BOLD)
+    heading('依頼元の推奨', 'recommendation')
     append(item['recommendation'])
     append()
-    append('候補 (↑↓で選択、Enter で確定)', curses.A_BOLD)
+    heading('候補 (↑↓で選択、Enter で確定)', 'options')
     choice = desk.draft()['choice'] if item['answer'] is None else item['answer']['choice']
     for index, option in enumerate(item['options']):
         choice_positions[option['id']] = len(lines)
@@ -513,6 +534,7 @@ def run(store, *, web_url=None):
         screen.keypad(True)
         screen.timeout(1000)
         desk = Desk(store, web_url)
+        desk.heading_styles = heading_styles()
         next_refresh = time.monotonic() + 1
 
         def edit(memo):

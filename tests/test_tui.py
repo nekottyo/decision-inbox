@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import Store
-from cue_tui import Desk, clip, decision_url, detail_lines, draw, edit_with_editor, handle_key, http_url, safe_text, width, wrap
+from cue_tui import Desk, HEADING_COLORS, clip, decision_url, detail_lines, draw, edit_with_editor, handle_key, heading_styles, http_url, safe_text, width, wrap
 from test_app import request_payload
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -257,6 +257,68 @@ class TuiTests(unittest.TestCase):
         with patch('cue_tui.curses.doupdate'):
             draw(screen, self.desk)
         self.assertIn('戻る', ''.join(screen.output))
+
+    def test_heading_colors_keep_body_normal_and_fall_back_to_bold(self):
+        with patch('cue_tui.curses.has_colors', return_value=True), patch.object(curses, 'COLORS', 256, create=True), patch.object(curses, 'COLOR_PAIRS', 256, create=True), patch('cue_tui.curses.use_default_colors'), patch('cue_tui.curses.init_pair') as initialize, patch('cue_tui.curses.color_pair', side_effect=lambda pair: pair << 8):
+            styles = heading_styles()
+            self.assertEqual(initialize.call_count, 4)
+        self.store.answer(self.first['id'], {'choice': 'minimal'})
+        claim = self.store.claim('見出し検証')
+        self.store.report(self.first['id'], {'token': claim['token'], 'status': 'blocked', 'reason': '承認が必要', 'next_step': '承認後に再処理'})
+        self.desk.change_view()
+        self.desk.heading_styles = styles
+        lines, _ = detail_lines(self.desk, 100)
+        attributes = dict(lines)
+        for label, kind in [('判断が必要な理由', 'context'), ('依頼元の推奨', 'recommendation'), ('候補 (↑↓で選択、Enter で確定)', 'options'), ('止まった理由', 'stopped'), ('再開に必要なこと', 'stopped')]:
+            self.assertEqual(attributes[label], styles[kind])
+        for body in ['承認が必要', '承認後に再処理', self.first['reason'], self.first['recommendation']]:
+            self.assertEqual(attributes[body], 0)
+        for colors, supported in [(0, False), (8, True)]:
+            with patch('cue_tui.curses.has_colors', return_value=supported), patch.object(curses, 'COLORS', colors, create=True), patch('cue_tui.curses.init_pair') as initialize:
+                self.assertTrue(all(attribute == curses.A_BOLD for attribute in heading_styles().values()))
+                initialize.assert_not_called()
+        with patch('cue_tui.curses.has_colors', side_effect=curses.error('色なし')):
+            self.assertTrue(all(attribute == curses.A_BOLD for attribute in heading_styles().values()))
+
+    def test_pty_soft_headings_and_monochrome_exit_without_saving(self):
+        self.store.answer(self.first['id'], {'choice': 'minimal'})
+        claim = self.store.claim('端末色の検証')
+        self.store.report(self.first['id'], {'token': claim['token'], 'status': 'blocked', 'reason': '承認が必要', 'next_step': '承認後に再処理'})
+        for terminal_name in ['xterm-256color', 'xterm', 'vt100']:
+            with self.subTest(terminal=terminal_name):
+                master, slave = os.openpty()
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 80, 120, 0, 0))
+                process = subprocess.Popen([sys.executable, str(ROOT / 'app.py'), '--db', str(self.db), 'tui'], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, 'TERM': terminal_name})
+                output = bytearray()
+
+                def pump(condition):
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if select.select([master], [], [], .02)[0]:
+                            output.extend(os.read(master, 65536))
+                        if condition():
+                            return
+                    self.fail(f'色の端末検証が完了しませんでした: {bytes(output)[-1000:]}')
+
+                try:
+                    pump(lambda: 'Enter 確定'.encode() in output)
+                    os.write(master, b'\t')
+                    pump(lambda: '再開に必要なこと'.encode() in output)
+                    if terminal_name == 'xterm-256color':
+                        for color in HEADING_COLORS.values():
+                            self.assertIn(f'38;5;{color}m'.encode(), output)
+                    else:
+                        self.assertNotIn(b'38;5;', output)
+                    os.write(master, b'\x1b')
+                    pump(lambda: process.poll() is not None)
+                    self.assertEqual(process.returncode, 0)
+                    self.assertIsNone(self.store.get(self.second['id'])['answer'])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    os.close(master)
+                    os.close(slave)
 
     def test_editor_uses_argv_and_preserves_oversized_memo(self):
         filenames = []
