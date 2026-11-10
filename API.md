@@ -43,7 +43,7 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 
 ## 回答済みの処理
 
-- `POST /api/claim`、body `{"worker":"front-desk","lease_seconds":300}` → `{"decision":依頼全体,"token":"秘密の claim token","worker":"front-desk","expires_at":"UTC ISO 8601"}`。対象がなければ `{"decision":null}`
+- `POST /api/claim`、body `{"worker":"front-desk","lease_seconds":300,"key_prefix":"任意"}` → `{"decision":依頼全体,"token":"秘密の claim token","worker":"front-desk","expires_at":"UTC ISO 8601"}`。対象がなければ `{"decision":null}`
 - `POST /api/decisions/{id}/complete`、body `{"token":"claim 時の token"}` → 完了後の依頼全体
 - `POST /api/decisions/{id}/renew`、body `{"token":"現在の token","lease_seconds":3600}` → `{"decision":依頼全体,"expires_at":"延長後の UTC ISO 8601"}`。現時点で有効な token だけ延長でき、期限切れ・古い token・完了後は `409`。更新しても token は変わらず、元の期限より短くしない
 - `POST /api/decisions/{id}/report`、body `{"token":"現在の token","status":"blocked","reason":"承認が必要","next_step":"承認後に再試行"}` → 保存後の依頼全体。status は `blocked/failed` のみ、reason/next_step はそれぞれ必須の 1〜4000 文字。現時点で有効な処理中 token が必要。報告後は lease と token を解放し、自動 claim・回答通知の対象から外す
@@ -88,7 +88,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 backup --output /tmp/decision-bac
 
 対象は pending または lease の期限が切れた processing。未回答・完了・blocked/failed・有効な lease の処理中案件を除外し、ID は claim と同じ回答日時順。起動時に既存の対象も通知し、同じ対象が処理可能なままなら繰り返し通知しない。対象外になった後に再び処理可能になると再通知する。ポーリング間に完了した状態遷移は検知できないため、通知を完全なイベント履歴として扱わない。再起動時は処理可能な対象を再通知する。
 
-`--interval` と `--timeout` は正の有限秒数で、既定は 2 秒と 1740 秒。timeout または Ctrl+C で正常終了し、DB エラーは stderr の JSON と非ゼロ終了で通知する。timeout は通知先が終了を受けて張り直すための境界。watch 自体は agent を起動せず、claim・complete・再送・ハーネス連携を行わない。本文・回答内容・メモ・token を通知に含めない。通知先はその時点の状態を CLI で再取得し、有効な claim の取得後にだけ処理する。
+`--key-prefix` を指定すると request_key がその接頭辞で始まる判断だけを通知する。`--interval` と `--timeout` は正の有限秒数で、既定は 2 秒と 1740 秒。timeout または Ctrl+C で正常終了し、DB エラーは stderr の JSON と非ゼロ終了で通知する。timeout は通知先が終了を受けて張り直すための境界。watch 自体は agent を起動せず、claim・complete・再送・ハーネス連携を行わない。本文・回答内容・メモ・token を通知に含めない。通知先はその時点の状態を CLI で再取得し、有効な claim の取得後にだけ処理する。
 
 ## 保存形式の更新とバックアップ
 

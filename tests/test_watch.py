@@ -135,11 +135,26 @@ class KeyPrefixTests(unittest.TestCase):
         self.assertIsNone(self.store.claim('w', 300, 'run-a/')['decision'])
         self.assertEqual(self.store.claim('w')['decision']['id'], other)
 
+    def test_cli_claim_and_watch_pass_prefix(self):
+        self.keyed('run-b/1')
+        mine = self.keyed('run-a/1')
+        db = str(Path(self.temp.name) / 'queue.sqlite3')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            main(['--db', db, 'watch', '--key-prefix', 'run-a/', '--timeout', '0.01'])
+        self.assertEqual([json.loads(line)['decision_ids'] for line in output.getvalue().splitlines()], [[mine]])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            main(['--db', db, 'claim', '--worker', 'w', '--key-prefix', 'run-a/'])
+        self.assertEqual(json.loads(output.getvalue())['decision']['id'], mine)
+
     def test_prefix_is_literal_and_validated(self):
-        self.keyed('run_a/1')
+        mine = self.keyed('run_a/1')
+        self.keyed('runXa/1')
+        self.keyed('RUN_a/1')
+        self.assertEqual(self.store.ready('run_'), [mine])
         with self.assertRaises(Exception):
             self.store.ready('run%')
-        self.assertEqual(self.store.ready('run_'), self.store.ready())
         with self.assertRaises(Exception):
             self.store.claim('w', 300, 'run a')
         with self.assertRaises(Exception):

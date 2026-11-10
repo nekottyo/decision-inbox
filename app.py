@@ -506,6 +506,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(201, store.add(payload))
                 if path == '/api/claim':
                     object_fields(payload, ('worker',), ('lease_seconds', 'key_prefix'))
+                    if 'key_prefix' in payload and payload['key_prefix'] is None:
+                        # null を未指定扱いにすると全件 claim になり、絞り込みが黙って外れる
+                        raise AppError(400, 'key_prefix は文字列で指定してください')
                     return self.json_response(200, store.claim(payload['worker'], payload.get('lease_seconds', 300), payload.get('key_prefix')))
                 match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|renew)', path)
                 if match:
