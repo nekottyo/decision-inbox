@@ -186,6 +186,17 @@ class HTTPTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_http_claim_key_prefix_filters_and_rejects_null(self):
+        for key in ('run-a/1', 'run-b/1'):
+            _, item, _ = self.request('POST', '/api/decisions', request_payload(request_key=key))
+            self.request('POST', f"/api/decisions/{item['id']}/answer", {'choice': 'minimal'})
+        for bad in (None, '', 'run a', 1):
+            self.assertEqual(self.request('POST', '/api/claim', {'worker': 'w', 'key_prefix': bad})[0], 400)
+        status, miss, _ = self.request('POST', '/api/claim', {'worker': 'w', 'key_prefix': 'run-c/'})
+        self.assertEqual((status, miss), (200, {'decision': None}))
+        status, hit, _ = self.request('POST', '/api/claim', {'worker': 'w', 'key_prefix': 'run-b/'})
+        self.assertEqual(hit['decision']['request_key'], 'run-b/1')
+
     def test_http_restart_preserves_answer_and_consumer_round_trip(self):
         status, item, _ = self.request('POST', '/api/decisions', request_payload())
         self.assertEqual(status, 201)

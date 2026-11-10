@@ -111,5 +111,55 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(missing.exists())
 
 
+class KeyPrefixTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name) / 'queue.sqlite3')
+
+    def answered(self):
+        item = self.store.add(request_payload())
+        return self.store.answer(item['id'], {'choice': 'minimal'})['id']
+
+    def keyed(self, key):
+        item = self.store.add(request_payload(request_key=key))
+        return self.store.answer(item['id'], {'choice': 'minimal'})['id']
+
+    def test_claim_and_ready_only_see_matching_prefix(self):
+        other = self.keyed('run-b/1')
+        self.answered()
+        mine = self.keyed('run-a/1')
+        self.assertEqual(self.store.ready('run-a/'), [mine])
+        self.assertEqual(len(self.store.ready()), 3)
+        self.assertEqual(self.store.claim('w', 300, 'run-a/')['decision']['id'], mine)
+        self.assertIsNone(self.store.claim('w', 300, 'run-a/')['decision'])
+        self.assertEqual(self.store.claim('w')['decision']['id'], other)
+
+    def test_cli_claim_and_watch_pass_prefix(self):
+        self.keyed('run-b/1')
+        mine = self.keyed('run-a/1')
+        db = str(Path(self.temp.name) / 'queue.sqlite3')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            main(['--db', db, 'watch', '--key-prefix', 'run-a/', '--timeout', '0.01'])
+        self.assertEqual([json.loads(line)['decision_ids'] for line in output.getvalue().splitlines()], [[mine]])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            main(['--db', db, 'claim', '--worker', 'w', '--key-prefix', 'run-a/'])
+        self.assertEqual(json.loads(output.getvalue())['decision']['id'], mine)
+
+    def test_prefix_is_literal_and_validated(self):
+        mine = self.keyed('run_a/1')
+        self.keyed('runXa/1')
+        self.keyed('RUN_a/1')
+        self.assertEqual(self.store.ready('run_'), [mine])
+        with self.assertRaises(Exception):
+            self.store.ready('run%')
+        with self.assertRaises(Exception):
+            self.store.claim('w', 300, 'run a')
+        with self.assertRaises(Exception):
+            self.store.claim('w', 300, '')
+
+
 if __name__ == '__main__':
     unittest.main()

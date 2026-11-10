@@ -151,6 +151,16 @@ def validate_lease(seconds):
     return seconds
 
 
+def prefix_clause(key_prefix):
+    if key_prefix is None:
+        return '', ()
+    key_prefix = text(key_prefix, 'key_prefix', 200)
+    if not re.fullmatch(r'[A-Za-z0-9_.:/-]+', key_prefix):
+        raise AppError(400, 'key_prefix は英数字と _ . : / - で指定してください')
+    # LIKE はワイルドカードの扱いが紛れるため substr で前方一致を取る
+    return ' AND substr(request_key,1,?)=?', (len(key_prefix), key_prefix)
+
+
 class Store:
     def __init__(self, path, readonly=False):
         self.path = str(path)
@@ -287,9 +297,10 @@ class Store:
         with self.db() as connection:
             return [self.public(row) for row in connection.execute('SELECT * FROM decisions ORDER BY created_at,id')]
 
-    def ready(self):
+    def ready(self, key_prefix=None):
+        clause, params = prefix_clause(key_prefix)
         with self.db() as connection:
-            return [row['id'] for row in connection.execute("SELECT id FROM decisions WHERE status='pending' OR (status='processing' AND lease_until<=?) ORDER BY decided_at,id", (time.time(),))]
+            return [row['id'] for row in connection.execute("SELECT id FROM decisions WHERE (status='pending' OR (status='processing' AND lease_until<=?))" + clause + " ORDER BY decided_at,id", (time.time(), *params))]
 
     def get(self, identifier):
         with self.db() as connection:
@@ -323,15 +334,16 @@ class Store:
             connection.execute('UPDATE decisions SET choice=NULL,memo=NULL,decided_at=NULL,status=NULL WHERE id=?', (identifier,))
         return self.get(identifier)
 
-    def claim(self, worker, lease_seconds=300):
+    def claim(self, worker, lease_seconds=300, key_prefix=None):
         text(worker, 'worker', 200)
         validate_lease(lease_seconds)
+        clause, params = prefix_clause(key_prefix)
         token = secrets.token_urlsafe(32)
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             now = time.time()
             expires = now + lease_seconds
-            row = connection.execute("SELECT * FROM decisions WHERE status='pending' OR (status='processing' AND lease_until<=?) ORDER BY decided_at,id LIMIT 1", (now,)).fetchone()
+            row = connection.execute("SELECT * FROM decisions WHERE (status='pending' OR (status='processing' AND lease_until<=?))" + clause + " ORDER BY decided_at,id LIMIT 1", (now, *params)).fetchone()
             if row is None:
                 return {'decision': None}
             connection.execute("UPDATE decisions SET status='processing',worker=?,token=?,lease_until=? WHERE id=?", (worker, token, expires, row['id']))
@@ -493,8 +505,11 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/decisions':
                     return self.json_response(201, store.add(payload))
                 if path == '/api/claim':
-                    object_fields(payload, ('worker',), ('lease_seconds',))
-                    return self.json_response(200, store.claim(payload['worker'], payload.get('lease_seconds', 300)))
+                    object_fields(payload, ('worker',), ('lease_seconds', 'key_prefix'))
+                    if 'key_prefix' in payload and payload['key_prefix'] is None:
+                        # null を未指定扱いにすると全件 claim になり、絞り込みが黙って外れる
+                        raise AppError(400, 'key_prefix は文字列で指定してください')
+                    return self.json_response(200, store.claim(payload['worker'], payload.get('lease_seconds', 300), payload.get('key_prefix')))
                 match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|renew)', path)
                 if match:
                     if match[2] == 'complete':
@@ -559,12 +574,12 @@ def positive_seconds(value):
     return seconds
 
 
-def watch_ready(store, interval, timeout):
+def watch_ready(store, interval, timeout, key_prefix=None):
     deadline = time.monotonic() + timeout
     previous = set()
     try:
         while True:
-            ready = store.ready()
+            ready = store.ready(key_prefix)
             added = [identifier for identifier in ready if identifier not in previous]
             for offset in range(0, len(added), 100):
                 print(json.dumps({'event': 'cue.ready', 'decision_ids': added[offset:offset + 100]}), flush=True)
@@ -591,11 +606,13 @@ def main(argv=None):
     watch = commands.add_parser('watch', help='処理可能な回答の ID を JSONL で通知する')
     watch.add_argument('--interval', type=positive_seconds, default=2)
     watch.add_argument('--timeout', type=positive_seconds, default=1740)
+    watch.add_argument('--key-prefix')
     tui = commands.add_parser('tui', help='判断を端末で確認して回答する')
     tui.add_argument('--web-url', default=os.environ.get('CUE_WEB_URL') or None)
     claim = commands.add_parser('claim')
     claim.add_argument('--worker', required=True)
     claim.add_argument('--lease-seconds', type=int, default=300)
+    claim.add_argument('--key-prefix')
     complete = commands.add_parser('complete')
     complete.add_argument('--id', required=True)
     complete.add_argument('--token', required=True)
@@ -641,7 +658,7 @@ def main(argv=None):
             return 0
         store = Store(args.db, readonly=args.command in ('watch', 'backup'))
         if args.command == 'watch':
-            return watch_ready(store, args.interval, args.timeout)
+            return watch_ready(store, args.interval, args.timeout, args.key_prefix)
         if args.command == 'add':
             with args.file.open('rb') as handle:
                 raw = handle.read(MAX_BODY + 1)
@@ -651,7 +668,7 @@ def main(argv=None):
         elif args.command == 'list':
             result = {'decisions': store.list(), 'demo': False}
         elif args.command == 'claim':
-            result = store.claim(args.worker, args.lease_seconds)
+            result = store.claim(args.worker, args.lease_seconds, args.key_prefix)
         elif args.command == 'undo':
             result = store.undo(args.id, {'decided_at': args.decided_at})
         elif args.command == 'report':
