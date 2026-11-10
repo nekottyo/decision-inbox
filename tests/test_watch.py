@@ -111,5 +111,40 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(missing.exists())
 
 
+class KeyPrefixTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name) / 'queue.sqlite3')
+
+    def answered(self):
+        item = self.store.add(request_payload())
+        return self.store.answer(item['id'], {'choice': 'minimal'})['id']
+
+    def keyed(self, key):
+        item = self.store.add(request_payload(request_key=key))
+        return self.store.answer(item['id'], {'choice': 'minimal'})['id']
+
+    def test_claim_and_ready_only_see_matching_prefix(self):
+        other = self.keyed('run-b/1')
+        self.answered()
+        mine = self.keyed('run-a/1')
+        self.assertEqual(self.store.ready('run-a/'), [mine])
+        self.assertEqual(len(self.store.ready()), 3)
+        self.assertEqual(self.store.claim('w', 300, 'run-a/')['decision']['id'], mine)
+        self.assertIsNone(self.store.claim('w', 300, 'run-a/')['decision'])
+        self.assertEqual(self.store.claim('w')['decision']['id'], other)
+
+    def test_prefix_is_literal_and_validated(self):
+        self.keyed('run_a/1')
+        with self.assertRaises(Exception):
+            self.store.ready('run%')
+        self.assertEqual(self.store.ready('run_'), self.store.ready())
+        with self.assertRaises(Exception):
+            self.store.claim('w', 300, 'run a')
+        with self.assertRaises(Exception):
+            self.store.claim('w', 300, '')
+
+
 if __name__ == '__main__':
     unittest.main()

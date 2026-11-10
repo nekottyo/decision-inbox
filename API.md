@@ -49,6 +49,8 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 - `POST /api/decisions/{id}/report`、body `{"token":"現在の token","status":"blocked","reason":"承認が必要","next_step":"承認後に再試行"}` → 保存後の依頼全体。status は `blocked/failed` のみ、reason/next_step はそれぞれ必須の 1〜4000 文字。現時点で有効な処理中 token が必要。報告後は lease と token を解放し、自動 claim・回答通知の対象から外す
 - `POST /api/decisions/{id}/retry`、body `{"decided_at":"現在の回答時刻","reported_at":"現在の停止報告時刻"}` → pending に戻した依頼全体。人が明示的に再試行するときだけ使用する。blocked/failed と両時刻の完全一致が必要で、古い報告や完了済みなら `409`。停止理由と次の操作は履歴に残して現在欄を空に戻す。過去の claim 記録は保持するため再試行後も取り消しは不可
 
+claim の body と CLI `--key-prefix` に任意の `key_prefix` を渡すと、request_key がその接頭辞で始まる判断だけを対象にする (request_key なしは対象外)。`watch --key-prefix` も同じ。文字種と最大長は request_key と同じで、未指定時の挙動は変わらない。複数 run が同じ DB を共有するときは、起票時の request_key に run 固有の接頭辞を付けて指定する。
+
 lease_seconds は省略時 300、1〜3600 秒。front-desk は 3600 秒を指定。回答日時順 (同時刻は ID 順) の FIFO。期限切れの processing は再 claim 可能。有効かつ一致する token のみ complete 可能、それ以外は `409`。consumer は decision ID で冪等に処理し、外部副作用前に適用済みか確認。claim token は通常の一覧・詳細・履歴には含めない。
 
 処理失敗や承認待ちは complete せず、期限内に report して停止理由を残す。report できなかった状態で lease が切れた場合だけ再配送される。renew だけで二重実行を防げるとは扱わず、再取得や再試行の前に適用済みか確認する。
