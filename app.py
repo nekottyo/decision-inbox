@@ -20,6 +20,11 @@ import uuid
 ROOT = Path(__file__).resolve().parent
 MAX_BODY = 131072
 ASSETS = {'/assets/demo-flow.svg': ('assets/demo-flow.svg', 'image/svg+xml')}
+LANES = {'todo': '未着手', 'human_decision': '人の判断待ち', 'worker': 'worker 作業中', 'human_action': '人の操作待ち', 'done': '完了'}
+TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'lane', 'decision_id')
+# add の再送判定で比べる登録内容。lane / result / remaining / decision_id は move / update で進むので比べない
+TASK_IDENTITY = ('title', 'request', 'pane', 'run')
+TASK_LIMITS = {'title': 200, 'request': 1000, 'pane': 200, 'run': 200, 'result': 2048, 'remaining': 2000}
 WEB_ROOT = ROOT / 'frontend' / 'dist'
 STATIC = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/assets/app.js': ('assets/app.js', 'text/javascript; charset=utf-8'), '/assets/app.css': ('assets/app.css', 'text/css; charset=utf-8')}
 
@@ -119,6 +124,31 @@ def validate_request(payload):
     return item
 
 
+def validate_task(payload):
+    """payload に入った項目だけを検査して返す。decision_id の存在確認は Store.check_decision が行う"""
+    item = {}
+    if 'id' in payload:
+        item['id'] = text(payload['id'], 'id', 200)
+        if not re.fullmatch(r'[A-Za-z0-9_.:/-]+', item['id']):
+            raise AppError(400, 'id は英数字と _ . : / - で指定してください')
+    for key, maximum in TASK_LIMITS.items():
+        if key in payload:
+            item[key] = text(payload[key], key, maximum, empty=key != 'title')
+    if 'lane' in payload:
+        if payload['lane'] not in LANES:
+            raise AppError(400, 'lane は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
+        item['lane'] = payload['lane']
+    if 'decision_id' in payload:
+        value = payload['decision_id']
+        if value in ('', None):
+            item['decision_id'] = None
+        else:
+            if not isinstance(value, str) or not re.fullmatch(r'[a-f0-9]{32}', value):
+                raise AppError(400, 'decision_id の形式が不正です')
+            item['decision_id'] = value
+    return item
+
+
 def parse_json(raw):
     def pairs(entries):
         result = {}
@@ -197,6 +227,14 @@ class Store:
             connection.execute('''CREATE TABLE IF NOT EXISTS answer_history (
                 id INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, event TEXT NOT NULL,
                 recorded_at TEXT NOT NULL, answer TEXT NOT NULL)''')
+            # user_version は 2 のまま上げない。旧 release の Store は 0/1/2 以外を 500 で拒否するため、
+            # 上げると release を戻せなくなる。表は IF NOT EXISTS で足すだけにする。
+            # lane に CHECK を付けないのは、lane の追加・改名で表の作り直しを避けるため。
+            connection.execute('''CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, request TEXT NOT NULL DEFAULT '',
+                pane TEXT NOT NULL DEFAULT '', run TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
+                remaining TEXT NOT NULL DEFAULT '', lane TEXT NOT NULL, decision_id TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -333,6 +371,56 @@ class Store:
             self.record(connection, row, 'undo')
             connection.execute('UPDATE decisions SET choice=NULL,memo=NULL,decided_at=NULL,status=NULL WHERE id=?', (identifier,))
         return self.get(identifier)
+
+    def check_decision(self, connection, item):
+        if item.get('decision_id') and not connection.execute('SELECT 1 FROM decisions WHERE id=?', (item['decision_id'],)).fetchone():
+            raise AppError(404, '関連する判断が見つかりません')
+
+    def add_task(self, payload):
+        object_fields(payload, ('id', 'title'), ('request', 'pane', 'run', 'result', 'remaining', 'lane', 'decision_id'))
+        item = validate_task(payload)
+        item = {'request': '', 'pane': '', 'run': '', 'result': '', 'remaining': '', 'lane': 'todo', 'decision_id': None, **item}
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            self.check_decision(connection, item)
+            row = connection.execute('SELECT * FROM tasks WHERE id=?', (item['id'],)).fetchone()
+            if row:
+                if any(row[key] != item[key] for key in TASK_IDENTITY):
+                    raise AppError(409, '同じ id に異なる task が登録されています')
+                return dict(row)
+            now = utc_now()
+            connection.execute('INSERT INTO tasks(id,title,request,pane,run,result,remaining,lane,decision_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                               (item['id'], *(item[key] for key in TASK_FIELDS), now, now))
+            return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (item['id'],)).fetchone())
+
+    def update_task(self, identifier, payload):
+        object_fields(payload, (), TASK_FIELDS)
+        if not payload:
+            raise AppError(400, '更新する項目を指定してください')
+        item = validate_task(payload)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if not connection.execute('SELECT 1 FROM tasks WHERE id=?', (identifier,)).fetchone():
+                raise AppError(404, 'task が見つかりません')
+            self.check_decision(connection, item)
+            columns = ''.join(f'{key}=?,' for key in item)
+            connection.execute(f'UPDATE tasks SET {columns}updated_at=? WHERE id=?', (*item.values(), utc_now(), identifier))
+            return dict(connection.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone())
+
+    def delete_task(self, identifier):
+        with self.db() as connection:
+            if not connection.execute('DELETE FROM tasks WHERE id=?', (identifier,)).rowcount:
+                raise AppError(404, 'task が見つかりません')
+        return {'deleted': identifier}
+
+    def tasks(self, lane=None):
+        if lane is not None and lane not in LANES:
+            raise AppError(400, 'lane は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
+        with self.db() as connection:
+            rows = [dict(row) for row in connection.execute('SELECT * FROM tasks ORDER BY created_at,id')]
+        order = list(LANES)
+        rows = [row for row in rows if lane is None or row['lane'] == lane]
+        return sorted(rows, key=lambda row: order.index(row['lane']) if row['lane'] in order else len(order))
 
     def claim(self, worker, lease_seconds=300, key_prefix=None):
         text(worker, 'worker', 200)
@@ -593,6 +681,38 @@ def watch_ready(store, interval, timeout, key_prefix=None):
     return 0
 
 
+def format_tasks(store, lane=None):
+    lines = []
+    tasks = store.tasks(lane)
+    for key, label in LANES.items():
+        if lane in (None, key):
+            group = [task for task in tasks if task['lane'] == key]
+            lines.append(f'## {label} ({len(group)})')
+            for task in group:
+                lines.append(f"- {task['title']}  [{task['id']}]")
+                updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
+                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('残り', task['remaining']), ('判断', task['decision_id'] or ''), ('更新', updated)]
+                lines.append('  ' + ' / '.join(f'{name}: {value}' for name, value in parts if value))
+    return '\n'.join(lines)
+
+
+def run_task(store, args):
+    if args.task_command == 'add':
+        payload = {'id': args.id, 'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'lane': args.lane, 'decision_id': args.decision}
+        return store.add_task({key: value for key, value in payload.items() if value is not None})
+    if args.task_command == 'move':
+        return store.update_task(args.id, {'lane': args.lane})
+    if args.task_command == 'update':
+        payload = {'title': args.title, 'request': args.request, 'pane': args.pane, 'run': args.run, 'result': args.result, 'remaining': args.remaining, 'decision_id': args.decision}
+        return store.update_task(args.id, {key: value for key, value in payload.items() if value is not None})
+    if args.task_command == 'delete':
+        return store.delete_task(args.id)
+    tasks = store.tasks(args.lane)
+    if args.json:
+        return {'lanes': [{'id': key, 'label': label, 'tasks': [task for task in tasks if task['lane'] == key]} for key, label in LANES.items() if args.lane in (None, key)]}
+    return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local decision inbox')
     parser.add_argument('--db', type=Path, default=default_db())
@@ -635,6 +755,24 @@ def main(argv=None):
     renew.add_argument('--lease-seconds', type=int, default=300)
     backup = commands.add_parser('backup')
     backup.add_argument('--output', type=Path, required=True)
+    task = commands.add_parser('task', help='依頼の進み具合を管理する')
+    task_commands = task.add_subparsers(dest='task_command', required=True)
+    for name in ('add', 'move', 'update', 'delete', 'list'):
+        sub = task_commands.add_parser(name)
+        if name != 'list':
+            sub.add_argument('--id', required=True)
+        if name == 'add':
+            sub.add_argument('--title', required=True)
+        if name == 'update':
+            sub.add_argument('--title')
+        if name in ('add', 'update'):
+            for option in ('request', 'pane', 'run', 'result', 'remaining', 'decision'):
+                sub.add_argument('--' + option)
+        if name in ('add', 'move'):
+            sub.add_argument('--lane', required=name == 'move')
+        if name == 'list':
+            sub.add_argument('--lane')
+            sub.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
     try:
         if args.command == 'tui':
@@ -657,6 +795,13 @@ def main(argv=None):
                     pass
             return 0
         store = Store(args.db, readonly=args.command in ('watch', 'backup'))
+        if args.command == 'task':
+            result = run_task(store, args)
+            if result is None:
+                print(format_tasks(store, args.lane))
+                return 0
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.command == 'watch':
             return watch_ready(store, args.interval, args.timeout, args.key_prefix)
         if args.command == 'add':

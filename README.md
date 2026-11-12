@@ -73,6 +73,22 @@ description = "Cue: 判断する"
 
 Herdr は起動と popup の管理だけを担い、アプリ本体と DB は特定 harness に依存しません。popup を閉じても Web や処理キューは継続します。
 
+## 依頼の進み具合を追う
+
+判断とは別に、依頼 (task) が今どの段階かを lane で追えます。CLI で登録・移動し、TUI で読み取り専用に確認します。
+
+```sh
+python3 app.py task add --id fix-login --title "ログイン修正" --pane 1-2 --lane worker
+python3 app.py task move --id fix-login --lane human_decision
+python3 app.py task update --id fix-login --remaining "回答待ち" --decision DECISION_ID
+python3 app.py task list
+python3 app.py task delete --id fix-login
+```
+
+- lane: `todo` (未着手) / `human_decision` (人の判断待ち) / `worker` (worker 作業中) / `human_action` (人の操作待ち) / `done` (完了)
+
+TUI では `b` で一覧を開き、↑↓ でスクロール、`b` で戻ります。Web と HTTP API には出ません。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
+
 ## 配置と更新
 
 開発用 worktree と分離する配置例として、`~/.local/share/cue/releases/<commit SHA>/` に検証済みの版を保存し、`~/.local/share/cue/current` から参照できます。`~/.local/bin/decision-inbox` を `current/app.py` へのリンクにすると、開発用 worktree の移動や片づけに依存せず起動できます。DB は repo 外の user data directory に保持します。
