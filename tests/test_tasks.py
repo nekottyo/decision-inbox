@@ -259,7 +259,7 @@ class TmuxClientTests(unittest.TestCase):
     def test_pane_pid_自身が_client_でも拾う(self):
         self.assertEqual(self.clients('400 1 herdr --session=x\n'), {'x': '%4'})
 
-    def test_孫より深い_herdr_は_client_として拾わない(self):
+    def test_孫以下の_herdr_は_client_として拾わない(self):
         table = '100 1 -zsh\n101 100 sh -c run\n102 101 herdr pane list\n103 101 herdr --session x\n200 1 herdr pane list\n'
         self.assertEqual(self.clients(table), {})
 
@@ -377,6 +377,24 @@ class TaskTuiTests(unittest.TestCase):
                 draw(screen, desk)
             self.assertGreater(desk.task_scroll, 0)
             self.assertEqual(attributes['> 件19'], curses.A_REVERSE | curses.A_BOLD)
+
+    def test_判断つきの_task_を選ぶと判断の行まで見える位置へ追従する(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, desk = self.make(directory)
+            decision = store.add(request_payload(title='途中の判断'))
+            store.add_task({'id': 'd1', 'title': '判断つき', 'lane': 'human_decision', 'decision_id': decision['id']})
+            # 判断の行が画面の下端を越える位置に来るよう、前に task を積む
+            for number in range(6):
+                store.add_task({'id': f'y{number}', 'title': f'前{number}', 'lane': 'todo'})
+            desk.refresh()
+            while desk.task_id != 'd1':
+                handle_key(desk, 'j')
+            screen = Screen(12, 100)
+            with patch('cue_tui.curses.doupdate'):
+                draw(screen, desk)
+            output = '\n'.join(screen.output)
+            self.assertIn('> 判断つき', output)
+            self.assertIn('    判断 未回答 途中の判断', output)
 
     def test_人待ちの_lane_と判断の状態を色と記号で分ける(self):
         with tempfile.TemporaryDirectory() as directory:
