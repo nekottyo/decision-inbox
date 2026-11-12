@@ -86,6 +86,7 @@ python3 app.py task delete --id fix-login
 ```
 
 - lane: `todo` (未着手) / `human_decision` (人の判断待ち) / `worker` (worker 作業中) / `human_action` (人の操作待ち) / `done` (完了)
+
 TUI では `b` で一覧を開き、↑↓ でスクロール、`b` で戻ります。Web と HTTP API には出ません。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
 
 ## 配置と更新
