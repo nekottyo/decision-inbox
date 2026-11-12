@@ -140,16 +140,24 @@ def validate_request(payload):
 FILE_LIMIT = 262144
 
 
+FILES_ROOTS = ('~/.agents/state/runs', '~/.ghq/github.com/nekottyo/obsidian-vault/nekottyo/claude-knowledge/review-repo')
+
+
 def files_root(value=None):
-    return Path(value or os.environ.get('CUE_FILES_ROOT') or Path.home() / '.agents' / 'state' / 'runs').expanduser()
+    """読める root の一覧。launchd と plugin は flag を渡せないので、既定値に必要な場所を並べておく"""
+    env = os.environ.get('CUE_FILES_ROOT')
+    values = value or (env.split(os.pathsep) if env else FILES_ROOTS)
+    if isinstance(values, (str, Path)):
+        values = [values]
+    return [Path(item).expanduser() for item in values if item]
 
 
 def read_text_file(path, root):
-    """root の下にある UTF-8 テキストだけを返す。登録された path は外部入力なので、symlink と .. を realpath で解いてから比べる"""
-    root = os.path.realpath(root)
+    """root (1 つか一覧) の下にある UTF-8 テキストだけを返す。登録された path は外部入力なので、symlink と .. を realpath で解いてから比べる"""
+    roots = [os.path.realpath(item) for item in ([root] if isinstance(root, (str, Path)) else root)]
     real = os.path.realpath(path)
-    if os.path.commonpath([root, real]) != root:
-        raise AppError(403, f'{root} の外にあるファイルは表示しません')
+    if not any(os.path.commonpath([item, real]) == item for item in roots):
+        raise AppError(403, f'{"、".join(roots)} の外にあるファイルは表示しません')
     try:
         # FIFO を開いて待たないよう O_NONBLOCK で開き、通常ファイルかは開いた fd で確かめる
         with open(os.open(real, os.O_RDONLY | os.O_NONBLOCK), 'rb') as handle:
@@ -885,7 +893,7 @@ def main(argv=None):
     serve = commands.add_parser('serve')
     serve.add_argument('--port', type=int, default=4317)
     serve.add_argument('--demo', action='store_true')
-    serve.add_argument('--files-root', help='判断の files を読める場所 (既定は CUE_FILES_ROOT、無ければ ~/.agents/state/runs)')
+    serve.add_argument('--files-root', action='append', help='判断の files を読める場所。繰り返し指定できる (既定は CUE_FILES_ROOT を : で区切ったもの、無ければ FILES_ROOTS)')
     add = commands.add_parser('add')
     add.add_argument('--file', type=Path, required=True)
     listing = commands.add_parser('list')
@@ -903,7 +911,7 @@ def main(argv=None):
     watch.add_argument('--key-prefix')
     tui = commands.add_parser('tui', help='判断を端末で確認して回答する')
     tui.add_argument('--web-url', default=os.environ.get('CUE_WEB_URL') or None)
-    tui.add_argument('--files-root', help='serve と同じ')
+    tui.add_argument('--files-root', action='append', help='serve と同じ')
     claim = commands.add_parser('claim')
     claim.add_argument('--worker', required=True)
     claim.add_argument('--lease-seconds', type=int, default=300)

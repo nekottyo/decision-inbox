@@ -144,7 +144,7 @@ python3 app.py list --include-withdrawn
 
 `changes.json` は変える項目だけの JSON オブジェクトで、`request_key` は変えられません。更新すると Web と TUI の一覧・詳細に「更新あり」と理由が出て、表示中の人にも知らせます。表示後に更新された判断への回答は、最新の内容を確認するよう拒否します。取り下げた判断は `list` と画面から消え、回答できなくなります (`GET /api/decisions/{id}` と `list --include-withdrawn` では見えます)。どちらも未回答の判断だけが対象で、回答済み (claim 中を含む) は拒否します。claim 中の判断は token を持つ worker が report または complete で閉じてください。旧 release に戻すと、取り下げた判断が未回答として再表示されます。
 
-返信の下書きなど手元のテキストを判断と一緒に見せるときは、`"files": [{"path": "/絶対パス/reply.draft.md", "label": "返信の下書き"}]` を足します。登録するのはパスだけで、中身は Web と TUI が開くたびに読み直すので、登録後に直した下書きも最新が見えます。読めるのは `serve` / `tui` の `--files-root` (既定は環境変数 `CUE_FILES_ROOT`、無ければ `~/.agents/state/runs`) の下にある UTF-8 テキストだけで、256 KiB まで。Web は等幅のテキストのまま表示し、HTML として描画しません。TUI は `o` の一覧から選ぶと `$PAGER` (既定 less) で開きます。root の外、存在しない、テキストでないファイルは理由を出して表示しません。
+返信の下書きなど手元のテキストを判断と一緒に見せるときは、`"files": [{"path": "/絶対パス/reply.draft.md", "label": "返信の下書き"}]` を足します。登録するのはパスだけで、中身は Web と TUI が開くたびに読み直すので、登録後に直した下書きも最新が見えます。読めるのは `serve` / `tui` の `--files-root` (繰り返し指定できる。既定は環境変数 `CUE_FILES_ROOT` を `:` で区切ったもの、無ければ `~/.agents/state/runs` と Obsidian vault のレビュー記録 `~/.ghq/github.com/nekottyo/obsidian-vault/nekottyo/claude-knowledge/review-repo`) の下にある UTF-8 テキストだけで、256 KiB まで。Web は等幅のテキストのまま表示し、HTML として描画しません。TUI は `o` の一覧から選ぶと `$PAGER` (既定 less) で開きます。root の外、存在しない、テキストでないファイルは理由を出して表示しません。
 
 `app.py` は実行可能な CLI entry point です。窓口側で symlink を設置した環境では、上記の `python3 app.py` を `decision-inbox` に置き換えられます。この repo 自体は symlink の設置や harness の起動を行いません。
 

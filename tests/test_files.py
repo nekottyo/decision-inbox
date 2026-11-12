@@ -4,9 +4,10 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import FILE_LIMIT, AppError, Store, make_server, read_text_file
+from app import FILE_LIMIT, AppError, Store, files_root, make_server, read_text_file
 from cue_tui import Desk, detail_lines, handle_key
 from test_app import HTTPTests, request_payload
 
@@ -73,6 +74,19 @@ class FileTests(unittest.TestCase):
             self.assertIn('の外にあるファイルは表示しません', self.error(403, lambda: read_text_file(str(path), self.root)))
         # 登録時の検査を通らない .. も、読む側で realpath により root 外と判定する
         self.error(403, lambda: read_text_file(str(self.root / 'run-1' / '..' / '..' / 'secret.txt'), self.root))
+
+    def test_root_を複数持てどれかの下なら読める(self):
+        review = Path(self.temp.name) / 'review-repo'
+        (review / 'reviews').mkdir(parents=True)
+        (review / 'reviews' / 'pr-1.md').write_text('レビュー記録', encoding='utf-8')
+        roots = files_root([str(self.root), str(review)])
+        self.assertEqual(read_text_file(str(review / 'reviews' / 'pr-1.md'), roots), 'レビュー記録')
+        self.assertEqual(read_text_file(str(self.draft), roots), '# 返信の下書き\n<b>そのまま</b>\n')
+        self.error(403, lambda: read_text_file(str(self.outside), roots))
+        with unittest.mock.patch.dict(os.environ, {'CUE_FILES_ROOT': f'{self.root}{os.pathsep}{review}'}):
+            self.assertEqual(files_root(), [self.root, review])
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(len(files_root()), 2)
 
     def test_root_自体が_symlink_でも中のファイルは読める(self):
         alias = Path(self.temp.name) / 'alias'

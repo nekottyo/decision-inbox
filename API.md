@@ -37,7 +37,7 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 
 - `GET /api/decisions/{id}/files/{index}` → `{"path":"...","label":"...","content":"本文"}`
 
-表示のたびにファイルを読むので、登録後に直した内容が見える。任意のパスは受けず、登録済みの `files[index]` だけを読む。読めるのは server の `--files-root` (既定は環境変数 `CUE_FILES_ROOT`、無ければ `~/.agents/state/runs`) の下だけで、path と root をそれぞれ realpath で解いてから比べるため、symlink や `..` で root の外へ出るものは `403`。ほかに存在しない・index 範囲外は `404`、ディレクトリや FIFO など通常ファイル以外は `400`、256 KiB 超は `413`、UTF-8 として読めないか NUL を含むものは `415`。エラー body の `error` に理由が入る。Web は `content` を等幅のテキストとしてそのまま表示し、HTML として描画しない。TUI は同じ読み取り処理 (`Store.file`) で本文を取り、制御文字を無害化して `$PAGER` (既定 less) に渡す。`tui --files-root` も同じ既定値を使う。
+表示のたびにファイルを読むので、登録後に直した内容が見える。任意のパスは受けず、登録済みの `files[index]` だけを読む。読めるのは server の `--files-root` (繰り返し指定できる。既定は環境変数 `CUE_FILES_ROOT` を `:` で区切ったもの、無ければ `~/.agents/state/runs` と `~/.ghq/github.com/nekottyo/obsidian-vault/nekottyo/claude-knowledge/review-repo`) のどれかの下だけで、path と root をそれぞれ realpath で解いてから比べるため、symlink や `..` で root の外へ出るものは `403`。ほかに存在しない・index 範囲外は `404`、ディレクトリや FIFO など通常ファイル以外は `400`、256 KiB 超は `413`、UTF-8 として読めないか NUL を含むものは `415`。エラー body の `error` に理由が入る。Web は `content` を等幅のテキストとしてそのまま表示し、HTML として描画しない。TUI は同じ読み取り処理 (`Store.file`) で本文を取り、制御文字を無害化して `$PAGER` (既定 less) に渡す。`tui --files-root` も同じ既定値を使う。
 
 旧 release は `files` を未知の項目として `400` で拒否する。`files` を付けて登録する側は、この版へ入れ替えてから使う。
 
