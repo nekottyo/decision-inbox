@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -67,7 +68,7 @@ def url(value, image=False):
 
 
 def validate_request(payload):
-    object_fields(payload, ('title', 'source', 'reason', 'options', 'recommended', 'recommendation'), ('background', 'priority', 'urgency_reason', 'deadline', 'links', 'image', 'request_key'))
+    object_fields(payload, ('title', 'source', 'reason', 'options', 'recommended', 'recommendation'), ('background', 'priority', 'urgency_reason', 'deadline', 'links', 'files', 'image', 'request_key'))
     item = {key: text(payload[key], key, maximum) for key, maximum in [('title', 200), ('source', 200), ('reason', 4000), ('recommendation', 4000)]}
     for key, maximum in [('background', 12000), ('urgency_reason', 2000)]:
         item[key] = text(payload.get(key, ''), key, maximum, empty=True)
@@ -110,6 +111,18 @@ def validate_request(payload):
         if link['kind'] not in ('pr', 'issue', 'other'):
             raise AppError(400, 'リンクの種別が不正です')
         item['links'].append({'url': url(link['url']), 'label': text(link['label'], 'リンク名', 200), 'kind': link['kind']})
+    files = payload.get('files', [])
+    if not isinstance(files, list) or len(files) > 20:
+        raise AppError(400, 'ファイルは 20 件までです')
+    # 中身や存在は読むときに見る。登録時に見ると、下書きを消した後の update や再送が通らなくなる
+    if files:
+        item['files'] = []
+        for entry in files:
+            object_fields(entry, ('path', 'label'))
+            path = text(entry['path'], 'ファイルのパス', 4096)
+            if not path.startswith('/') or '..' in path.split('/'):
+                raise AppError(400, 'ファイルは .. を含まない絶対パスで指定してください')
+            item['files'].append({'path': path, 'label': text(entry['label'], 'ファイル名', 200)})
     image = payload.get('image')
     if image is not None:
         object_fields(image, ('url', 'alt'))
@@ -122,6 +135,55 @@ def validate_request(payload):
     if len(json.dumps(item, ensure_ascii=False).encode()) > MAX_BODY:
         raise AppError(413, '依頼のサイズが上限を超えています')
     return item
+
+
+FILE_LIMIT = 262144
+
+
+FILES_ROOTS = ('~/.agents/state/runs', '~/.ghq/github.com/nekottyo/obsidian-vault/nekottyo/claude-knowledge/review-repo')
+
+
+def files_root(value=None):
+    """読める root の一覧。launchd と plugin は flag を渡せないので、既定値に必要な場所を並べておく"""
+    env = os.environ.get('CUE_FILES_ROOT')
+    values = value or (env.split(os.pathsep) if env else FILES_ROOTS)
+    if isinstance(values, (str, Path)):
+        values = [values]
+    return [Path(item).expanduser() for item in values if item]
+
+
+def read_text_file(path, root):
+    """root (1 つか一覧) の下にある UTF-8 テキストだけを返す。登録された path は外部入力なので、symlink と .. を realpath で解いてから比べる"""
+    roots = [os.path.realpath(item) for item in ([root] if isinstance(root, (str, Path)) else root)]
+    real = os.path.realpath(path)
+    if not any(os.path.commonpath([item, real]) == item for item in roots):
+        raise AppError(403, f'{"、".join(roots)} の外にあるファイルは表示しません')
+    try:
+        # FIFO を開いて待たないよう O_NONBLOCK で開き、通常ファイルかは開いた fd で確かめる
+        with open(os.open(real, os.O_RDONLY | os.O_NONBLOCK), 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise AppError(400, '通常のファイルではないため表示しません')
+            raw = handle.read(FILE_LIMIT + 1)
+    except FileNotFoundError:
+        raise AppError(404, 'ファイルが見つかりません') from None
+    except IsADirectoryError:
+        raise AppError(400, '通常のファイルではないため表示しません') from None
+    except PermissionError:
+        raise AppError(403, 'ファイルを読む権限がありません') from None
+    except NotADirectoryError:
+        raise AppError(404, 'ファイルが見つかりません') from None
+    except OSError as error:
+        # symlink ループや長すぎる名前など。素の OSError で漏らすと Web は 500、TUI は pager の失敗と誤って出る
+        raise AppError(400, f'ファイルを開けません ({error.strerror})') from None
+    if len(raw) > FILE_LIMIT:
+        raise AppError(413, f'{FILE_LIMIT // 1024} KiB を超えるファイルは表示しません')
+    try:
+        content = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        content = '\x00'
+    if '\x00' in content:
+        raise AppError(415, 'UTF-8 のテキストではないため表示しません')
+    return content
 
 
 def canonical(item):
@@ -313,7 +375,8 @@ class Store:
     def public(self, row, changes):
         if row is None:
             raise AppError(404, '案件が見つかりません')
-        item = json.loads(row['payload'])
+        # files は指定時だけ保存する (既存行の canonical を変えないため)。読む側には常に配列で渡す
+        item = {'files': [], **json.loads(row['payload'])}
         updates = [change for change in changes if change['event'] == 'update']
         withdrawn = next((change for change in changes if change['event'] == 'withdraw'), None)
         item.update(id=row['id'], created_at=row['created_at'], answer=None, revision=len(updates),
@@ -424,7 +487,7 @@ class Store:
         changes = payload['changes']
         if isinstance(changes, dict) and 'request_key' in changes:
             raise AppError(400, 'request_key は変更できません。別の依頼は新しい request_key で add してください')
-        object_fields(changes, (), ('title', 'source', 'reason', 'background', 'priority', 'urgency_reason', 'deadline', 'options', 'recommended', 'recommendation', 'links', 'image'))
+        object_fields(changes, (), ('title', 'source', 'reason', 'background', 'priority', 'urgency_reason', 'deadline', 'options', 'recommended', 'recommendation', 'links', 'files', 'image'))
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
@@ -454,6 +517,13 @@ class Store:
                 raise AppError(409, '回答済みの判断は取り下げられません。claim 中なら token を持つ worker が report または complete で閉じてください')
             connection.execute("INSERT INTO decision_changes(decision_id,event,recorded_at,note) VALUES(?,'withdraw',?,?)", (identifier, utc_now(), note))
             return self.fetch(connection, identifier)
+
+    def file(self, identifier, index, root):
+        """登録済みの files[index] を表示のたびに読む。任意のパスは受けない"""
+        files = self.get(identifier)['files']
+        if not 0 <= index < len(files):
+            raise AppError(404, 'ファイルが見つかりません')
+        return {**files[index], 'content': read_text_file(files[index]['path'], root)}
 
     def check_decision(self, connection, item):
         if item.get('decision_id') and not connection.execute('SELECT 1 FROM decisions WHERE id=?', (item['decision_id'],)).fetchone():
@@ -664,6 +734,9 @@ class Handler(BaseHTTPRequestHandler):
                 match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})', path)
                 if match:
                     return self.json_response(200, store.get(match[1]))
+                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/files/([0-9]{1,2})', path)
+                if match:
+                    return self.json_response(200, store.file(match[1], int(match[2]), self.server.files_root))
                 if path in ASSETS:
                     filename, content_type = ASSETS[path]
                     body = (ROOT / filename).read_bytes()
@@ -712,7 +785,7 @@ class Handler(BaseHTTPRequestHandler):
     do_POST = handle_action
 
 
-def make_server(db_path, port=0, demo=False):
+def make_server(db_path, port=0, demo=False, root=None):
     directory = tempfile.TemporaryDirectory(prefix='decision-inbox-demo-') if demo else None
     try:
         store = Store(Path(directory.name) / 'demo.sqlite3' if directory else db_path)
@@ -726,6 +799,7 @@ def make_server(db_path, port=0, demo=False):
     server.store = store
     server.demo = demo
     server.demo_directory = directory
+    server.files_root = files_root(root)
     return server
 
 
@@ -824,6 +898,7 @@ def main(argv=None):
     serve = commands.add_parser('serve')
     serve.add_argument('--port', type=int, default=4317)
     serve.add_argument('--demo', action='store_true')
+    serve.add_argument('--files-root', action='append', help='判断の files を読める場所。繰り返し指定できる (既定は CUE_FILES_ROOT を : で区切ったもの、無ければ FILES_ROOTS)')
     add = commands.add_parser('add')
     add.add_argument('--file', type=Path, required=True)
     listing = commands.add_parser('list')
@@ -841,6 +916,7 @@ def main(argv=None):
     watch.add_argument('--key-prefix')
     tui = commands.add_parser('tui', help='判断を端末で確認して回答する')
     tui.add_argument('--web-url', default=os.environ.get('CUE_WEB_URL') or None)
+    tui.add_argument('--files-root', action='append', help='serve と同じ')
     claim = commands.add_parser('claim')
     claim.add_argument('--worker', required=True)
     claim.add_argument('--lease-seconds', type=int, default=300)
@@ -895,11 +971,11 @@ def main(argv=None):
                 from cue_tui import run
             except ImportError:
                 raise AppError(400, 'この環境では TUI を利用できません') from None
-            return run(Store(args.db), web_url=web_url)
+            return run(Store(args.db), web_url=web_url, files_root=files_root(args.files_root))
         if args.command == 'serve':
             if not 0 <= args.port <= 65535:
                 raise AppError(400, 'port は 0〜65535 を指定してください')
-            with make_server(args.db, args.port, args.demo) as server:
+            with make_server(args.db, args.port, args.demo, args.files_root) as server:
                 print(f'Listening on http://127.0.0.1:{server.server_port}/' + (' (demo)' if args.demo else ''), flush=True)
                 try:
                     server.serve_forever()

@@ -384,7 +384,7 @@ class TuiTests(unittest.TestCase):
         self.assertIsNone(self.store.get(self.first['id'])['answer'])
 
     def test_pty_single_escape_closes_promptly_from_every_mode(self):
-        for mode, keys, expected in [(None, b'', 'Enter で選択'), ('quit', b'q', '未保存の候補'), ('help', b'?', 'Cue の操作'), ('links', b'o', '関連リンクを開く')]:
+        for mode, keys, expected in [(None, b'', 'Enter で選択'), ('quit', b'q', '未保存の候補'), ('help', b'?', 'Cue の操作'), ('links', b'o', '関連リンク・ファイルを開く')]:
             with self.subTest(mode=mode):
                 master, slave = os.openpty()
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))

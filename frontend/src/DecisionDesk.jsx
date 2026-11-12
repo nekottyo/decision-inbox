@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Button } from '@astryxdesign/core/Button';
 import { Badge } from '@astryxdesign/core/Badge';
 import { TabList, Tab } from '@astryxdesign/core/TabList';
@@ -34,6 +35,34 @@ function OptionLabel({ option, recommended }) {
 
 function OptionDescription({ option }) {
   return <span className="option-description"><span>利点：{option.benefits}</span><span>懸念：{option.concerns}</span></span>;
+}
+
+// 開くたびに server から読み直すので、登録後に直した下書きも最新が見える。本文は HTML として描画しない
+function AttachedFiles({ item }) {
+  const [opened, setOpened] = useState(null);
+  async function open(index) {
+    const request = { index, loading: true };
+    setOpened(request);
+    // 先に開いた別のファイルの応答で表示を上書きしない
+    const settle = result => setOpened(current => current === request ? { index, ...result } : current);
+    try {
+      const response = await fetch(`/api/decisions/${encodeURIComponent(item.id)}/files/${index}`, { cache: 'no-store' });
+      const data = await response.json();
+      settle(response.ok ? { content: data.content } : { error: data.error || '読み込めませんでした' });
+    } catch {
+      settle({ error: 'サーバーに接続できませんでした' });
+    }
+  }
+  return <section className="related files" aria-labelledby="files-heading"><h3 id="files-heading">ファイル</h3>
+    <ul>{item.files.map((file, index) => <li key={`${file.path}-${index}`}>
+      <button type="button" className="file-open" aria-expanded={opened?.index === index} onClick={() => opened?.index === index ? setOpened(null) : open(index)}>
+        <span>{file.label}</span><span className="link-target">{file.path}</span>
+      </button>
+      {opened?.index === index && (opened.loading ? <p className="file-status">読み込んでいます</p>
+        : opened.error ? <p className="file-status" role="alert">表示できません：{opened.error}</p>
+        : <pre className="file-content" tabIndex={0}>{opened.content}</pre>)}
+    </li>)}</ul>
+  </section>;
 }
 
 function RecordedAnswer({ item, saving, onUndo, onRetry }) {
@@ -121,6 +150,7 @@ export default function DecisionDesk({
             {item.background && <section className="background-section"><h3>背景</h3><p className="background">{item.background}</p></section>}
             {imageUrl && <figure className="reference-image"><img src={imageUrl} alt={item.image.alt} referrerPolicy="no-referrer" /><figcaption>{item.image.alt}</figcaption></figure>}
             {links.length > 0 && <section className="related" aria-label="関連リンク"><h3>関連する PR・issue</h3><ul>{links.map((link, index) => <li key={`${link.url}-${index}`}><a href={safeUrl(link.url)} target="_blank" rel="noopener noreferrer"><span className="link-kind">{{ pr: 'PR', issue: 'issue', other: '参考' }[link.kind]}</span><span>{link.label}</span><span className="link-target">別タブで開く</span></a></li>)}</ul></section>}
+            {item.files?.length > 0 && <AttachedFiles key={`${item.id}-${item.revision}`} item={item} />}
             <section className="recommendation" aria-labelledby="recommend-heading"><h3 id="recommend-heading">依頼元の推奨</h3><p>{item.recommendation}</p></section>
             {!item.answer && <form id="decision-form" onSubmit={event => { event.preventDefault(); if (!saving && draft.choice) onSubmit(); }}>
               <div className="option-list"><RadioList label="どう進めますか？" value={draft.choice} onChange={choice => onDraftChange({ ...draft, choice })} htmlName="choice" isRequired isDisabled={saving}>
