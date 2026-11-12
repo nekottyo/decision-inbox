@@ -40,6 +40,11 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.store.add_task({'id': 't1', 'title': '題', 'pane': 'p'}), first)
         self.assertEqual(self.status(self.store.add_task, {'id': 't1', 'title': '別'}), 409)
 
+    def test_進んだ_task_への_add_の再送は既存を返す(self):
+        self.store.add_task({'id': 't1', 'title': '題', 'lane': 'todo'})
+        moved = self.store.update_task('t1', {'lane': 'worker', 'remaining': '残り'})
+        self.assertEqual(self.store.add_task({'id': 't1', 'title': '題', 'lane': 'todo'}), moved)
+
     def test_更新は指定項目だけ変え更新時刻が進む(self):
         first = self.store.add_task({'id': 't1', 'title': '題', 'result': 'r'})
         updated = self.store.update_task('t1', {'remaining': '残り'})
@@ -135,6 +140,8 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual([lane['id'] for lane in data['lanes']], ['todo', 'human_decision', 'worker', 'human_action', 'done'])
         only = json.loads(self.cli('list', '--json', '--lane', 'done').stdout)
         self.assertEqual(len(only['lanes']), 1)
+        invalid = self.cli('list', '--json', '--lane', 'bogus')
+        self.assertEqual((invalid.returncode, invalid.stdout), (1, ''))
         self.assertEqual(json.loads(self.cli('delete', '--id', 't1').stdout), {'deleted': 't1'})
         failed = self.cli('delete', '--id', 't1')
         self.assertEqual(failed.returncode, 1)
@@ -160,6 +167,19 @@ class TaskTuiTests(unittest.TestCase):
             self.assertIn('完了 (0)', output)
             handle_key(desk, 'b')
             self.assertIsNone(desk.mode)
+
+    def test_task_の読み込み失敗は判断の表示と分けて_task_画面に出す(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'tui.sqlite3')
+            store.add(request_payload())
+            with patch.object(Store, 'tasks', side_effect=sqlite3.OperationalError('locked')):
+                desk = Desk(store)
+                self.assertEqual(desk.load_error, '')
+                handle_key(desk, 'b')
+            screen = Screen(24, 100)
+            with patch('cue_tui.curses.doupdate'):
+                draw(screen, desk)
+            self.assertIn('task を読み込めません', '\n'.join(screen.output))
 
 
 if __name__ == '__main__':

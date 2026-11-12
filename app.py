@@ -22,6 +22,8 @@ MAX_BODY = 131072
 ASSETS = {'/assets/demo-flow.svg': ('assets/demo-flow.svg', 'image/svg+xml')}
 LANES = {'todo': '未着手', 'human_decision': '人の判断待ち', 'worker': 'worker 作業中', 'human_action': '人の操作待ち', 'done': '完了'}
 TASK_FIELDS = ('title', 'request', 'pane', 'run', 'result', 'remaining', 'lane', 'decision_id')
+# add の再送判定で比べる登録内容。lane / result / remaining / decision_id は move / update で進むので比べない
+TASK_IDENTITY = ('title', 'request', 'pane', 'run')
 TASK_LIMITS = {'title': 200, 'request': 1000, 'pane': 200, 'run': 200, 'result': 2048, 'remaining': 2000}
 WEB_ROOT = ROOT / 'frontend' / 'dist'
 STATIC = {'/': ('index.html', 'text/html; charset=utf-8'), '/index.html': ('index.html', 'text/html; charset=utf-8'), '/assets/app.js': ('assets/app.js', 'text/javascript; charset=utf-8'), '/assets/app.css': ('assets/app.css', 'text/css; charset=utf-8')}
@@ -122,8 +124,8 @@ def validate_request(payload):
     return item
 
 
-def validate_task(payload, store=None):
-    """payload に入った項目だけを検査して返す。decision_id の存在確認は store があるときだけ行う"""
+def validate_task(payload):
+    """payload に入った項目だけを検査して返す。decision_id の存在確認は Store.check_decision が行う"""
     item = {}
     if 'id' in payload:
         item['id'] = text(payload['id'], 'id', 200)
@@ -383,7 +385,7 @@ class Store:
             self.check_decision(connection, item)
             row = connection.execute('SELECT * FROM tasks WHERE id=?', (item['id'],)).fetchone()
             if row:
-                if any(row[key] != item[key] for key in TASK_FIELDS):
+                if any(row[key] != item[key] for key in TASK_IDENTITY):
                     raise AppError(409, '同じ id に異なる task が登録されています')
                 return dict(row)
             now = utc_now()
@@ -705,8 +707,9 @@ def run_task(store, args):
         return store.update_task(args.id, {key: value for key, value in payload.items() if value is not None})
     if args.task_command == 'delete':
         return store.delete_task(args.id)
+    tasks = store.tasks(args.lane)
     if args.json:
-        return {'lanes': [{'id': key, 'label': label, 'tasks': store.tasks(key)} for key, label in LANES.items() if args.lane in (None, key)]}
+        return {'lanes': [{'id': key, 'label': label, 'tasks': [task for task in tasks if task['lane'] == key]} for key, label in LANES.items() if args.lane in (None, key)]}
     return None
 
 

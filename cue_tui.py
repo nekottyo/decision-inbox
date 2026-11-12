@@ -135,7 +135,7 @@ class Desk:
         self.notice, self.load_error = '', ''
         self.mode, self.menu_index = None, 0
         self.jump_choice = False
-        self.tasks, self.task_scroll = [], 0
+        self.tasks, self.task_scroll, self.task_error = [], 0, ''
         self.heading_styles = {}
         self.refresh()
 
@@ -146,16 +146,16 @@ class Desk:
     def refresh(self):
         # task の失敗で判断の表示を止めない
         try:
-            self.tasks, task_error = self.store.tasks(), ''
+            self.tasks, self.task_error = self.store.tasks(), ''
         except Exception as error:
-            self.tasks, task_error = [], f'task を読み込めません: {error}'
+            self.task_error = f'task を読み込めません: {error}。r で再試行できます'
         try:
             fresh = self.store.list()
         except Exception as error:
-            self.load_error = f'更新できません: {error}。r で再試行できます {task_error}'.strip()
+            self.load_error = f'更新できません: {error}。r で再試行できます'
             return
         old_ids = {item['id'] for item in self.items}
-        self.items, self.load_error = fresh, task_error
+        self.items, self.load_error = fresh, ''
         if self.item is not None:
             previous_answer = self.item['answer']
             current = next((item for item in fresh if item['id'] == self.item['id']), None)
@@ -378,7 +378,8 @@ def detail_lines(desk, columns):
 
 def task_lines(desk, columns):
     counts = {key: sum(task['lane'] == key for task in desk.tasks) for key in LANES}
-    order = ('human_decision', 'human_action', 'worker', 'todo', 'done')
+    # 人が動く lane を先に数える。並びの残りは LANES の順
+    order = sorted(LANES, key=lambda key: key not in ('human_decision', 'human_action'))
     lines = [' / '.join(f'{LANES[key]} {counts[key]}' for key in order)]
     for key, label in LANES.items():
         lines.append(f'■ {label} ({counts[key]})')
@@ -458,7 +459,8 @@ def draw(screen, desk):
                 put(4 + index * 2, 2, label, curses.A_REVERSE if desk.menu_index == index else 0)
             put(rows - 2, 2, '↑↓ / ←→で選択、Enter で決定、Esc で閉じる')
         elif desk.mode == 'tasks':
-            put(0, 2, 'task  ' + task_lines(desk, columns)[0], curses.A_BOLD)
+            # 読み込み失敗を 0 件と見分けられるよう、件数の代わりに失敗を出す
+            put(0, 2, desk.task_error or 'task  ' + task_lines(desk, columns)[0], curses.A_BOLD)
             lines = task_lines(desk, columns)[1:]
             visible = max(1, rows - 3)
             desk.task_scroll = min(max(0, desk.task_scroll), max(0, len(lines) - visible))
