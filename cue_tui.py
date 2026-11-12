@@ -558,7 +558,7 @@ def task_lines(desk, columns):
     answered = styles.get('recommendation', 0) & ~curses.A_BOLD
     lines, selected = [(' / '.join(f'{LANES[key]} {counts[key]}' for key in order), curses.A_BOLD)], None
     for key, label in LANES.items():
-        lines.append((f"{'▲' if key in human else '■'} {label} ({counts[key]})", waiting if key in human else curses.A_BOLD))
+        lines.append((f"{'▲' if key in human else '■'} {label} ({counts[key]})", waiting if key in human and counts[key] else curses.A_BOLD))
         for task in desk.tasks:
             if task['lane'] != key:
                 continue

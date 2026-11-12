@@ -414,7 +414,7 @@ class TaskTuiTests(unittest.TestCase):
                     draw(screen, desk)
                 waiting = styles.get('stopped', curses.A_BOLD)
                 self.assertEqual(attributes['▲ 人の判断待ち (1)'], waiting)
-                self.assertEqual(attributes['▲ 人の操作待ち (0)'], waiting)
+                self.assertEqual(attributes['▲ 人の操作待ち (0)'], curses.A_BOLD)
                 self.assertEqual(attributes['■ 完了 (0)'], curses.A_BOLD)
                 self.assertEqual(next(value for key, value in attributes.items() if key.startswith('    判断 未回答 未回答の判断')), waiting)
                 answered = next(value for key, value in attributes.items() if key.startswith('    判断 回答済み'))
