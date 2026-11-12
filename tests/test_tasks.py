@@ -259,7 +259,7 @@ class TmuxClientTests(unittest.TestCase):
     def test_pane_pid_自身が_client_でも拾う(self):
         self.assertEqual(self.clients('400 1 herdr --session=x\n'), {'x': '%4'})
 
-    def test_孫の_CLI_呼び出しは拾わない(self):
+    def test_孫より深い_herdr_は_client_として拾わない(self):
         table = '100 1 -zsh\n101 100 sh -c run\n102 101 herdr pane list\n103 101 herdr --session x\n200 1 herdr pane list\n'
         self.assertEqual(self.clients(table), {})
 

@@ -198,7 +198,8 @@ def tmux_clients(run=run_text):
     found = {}
     for line in panes.splitlines():
         tmux_pane, _, pid = line.partition('\t')
-        # 子孫全体は見ない。pane 内で走る herdr pane list を拾うため
+        # 子までしか見ない。herdr server は client の子として動くことがあり、子孫には
+        # herdr の pane 内の全 process (別 session の client を含む) が入るため
         for candidate in [pid, *children.get(pid, [])]:
             session = herdr_session_of(commands.get(candidate, ''))
             if session is not None:
