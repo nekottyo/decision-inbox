@@ -185,6 +185,10 @@ def validate_lease(seconds):
     return seconds
 
 
+# 旧 release に戻した間に取り下げ済みへ回答されると、回答済みかつ取り下げ済みの行ができる。claim / watch に渡さない
+NOT_WITHDRAWN = " AND NOT EXISTS(SELECT 1 FROM decision_changes WHERE decision_id=decisions.id AND event='withdraw')"
+
+
 def prefix_clause(key_prefix):
     if key_prefix is None:
         return '', ()
@@ -373,7 +377,7 @@ class Store:
     def ready(self, key_prefix=None):
         clause, params = prefix_clause(key_prefix)
         with self.db() as connection:
-            return [row['id'] for row in connection.execute("SELECT id FROM decisions WHERE (status='pending' OR (status='processing' AND lease_until<=?))" + clause + " ORDER BY decided_at,id", (time.time(), *params))]
+            return [row['id'] for row in connection.execute("SELECT id FROM decisions WHERE (status='pending' OR (status='processing' AND lease_until<=?))" + NOT_WITHDRAWN + clause + " ORDER BY decided_at,id", (time.time(), *params))]
 
     def get(self, identifier):
         with self.db() as connection:
@@ -384,7 +388,8 @@ class Store:
         choice = text(payload['choice'], '回答', 64)
         memo = text(payload.get('memo', ''), 'メモ', 2000, empty=True)
         revision = payload.get('revision')
-        if revision is not None and (type(revision) is not int or revision < 0):
+        # null を未指定扱いにすると古い版への回答が黙って通る
+        if 'revision' in payload and (type(revision) is not int or revision < 0):
             raise AppError(400, 'revision は 0 以上の整数を指定してください')
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -515,7 +520,7 @@ class Store:
             connection.execute('BEGIN IMMEDIATE')
             now = time.time()
             expires = now + lease_seconds
-            row = connection.execute("SELECT * FROM decisions WHERE (status='pending' OR (status='processing' AND lease_until<=?))" + clause + " ORDER BY decided_at,id LIMIT 1", (now, *params)).fetchone()
+            row = connection.execute("SELECT * FROM decisions WHERE (status='pending' OR (status='processing' AND lease_until<=?))" + NOT_WITHDRAWN + clause + " ORDER BY decided_at,id LIMIT 1", (now, *params)).fetchone()
             if row is None:
                 return {'decision': None}
             connection.execute("UPDATE decisions SET status='processing',worker=?,token=?,lease_until=? WHERE id=?", (worker, token, expires, row['id']))

@@ -95,6 +95,7 @@ class ChangeTests(unittest.TestCase):
         self.assertIn('更新されています', message)
         self.error(400, lambda: self.store.answer(item['id'], {'choice': 'minimal', 'revision': True}))
         self.error(400, lambda: self.store.answer(item['id'], {'choice': 'minimal', 'revision': '1'}))
+        self.error(400, lambda: self.store.answer(item['id'], {'choice': 'minimal', 'revision': None}))
         self.assertIsNone(self.store.get(item['id'])['answer'])
         self.assertEqual(self.store.answer(item['id'], {'choice': 'minimal', 'revision': 1})['answer']['choice'], 'minimal')
 
@@ -109,6 +110,23 @@ class ChangeTests(unittest.TestCase):
         message = self.error(409, lambda: self.store.add(payload))
         self.assertIn('新しい request_key', message)
         self.assertEqual(len(self.store.list(include_withdrawn=True)), 1)
+
+    def test_add_の再送は何度目の更新前の内容でも現行版(self):
+        payload = request_payload(request_key='run/1')
+        item = self.store.add(payload)
+        self.store.update(item['id'], {'note': '1 回目', 'changes': {'title': '中間の題名'}})
+        current = self.store.update(item['id'], {'note': '2 回目', 'changes': {'title': '最新の題名'}})
+        for title in (payload['title'], '中間の題名', '最新の題名'):
+            self.assertEqual(self.store.add({**payload, 'title': title}), current)
+
+    def test_旧_release_で回答された取り下げ済みは_claim_と_ready_に出ない(self):
+        item = self.store.add(request_payload())
+        self.store.withdraw(item['id'], {'note': '不要'})
+        with self.store.db() as connection:
+            # 旧 release は decision_changes を読まずに回答を書く
+            connection.execute("UPDATE decisions SET choice='minimal',memo='',decided_at='2026-11-12T00:00:00+00:00',status='pending' WHERE id=?", (item['id'],))
+        self.assertEqual(self.store.ready(), [])
+        self.assertIsNone(self.store.claim('worker')['decision'])
 
     def test_decisions_表だけの旧_DB_を開いても動き_user_version_は_2_のまま(self):
         path = Path(self.temp.name) / 'old.sqlite3'
@@ -202,6 +220,12 @@ class ChangeTuiTests(unittest.TestCase):
         self.assertEqual(self.desk.notice, 'この判断は取り下げられました: 不要になった')
         self.assertEqual(self.desk.item['id'], self.second['id'])
         self.assertNotIn(self.first['id'], self.desk.drafts)
+        self.assertFalse(self.desk.dirty())
+
+    def test_候補の先頭が変わっても触っていない下書きは終了確認を出さない(self):
+        self.assertEqual(self.desk.draft()['choice'], 'minimal')
+        self.store.update(self.first['id'], {'note': '並べ替え', 'changes': {'options': request_payload()['options'][::-1]}})
+        self.desk.refresh()
         self.assertFalse(self.desk.dirty())
 
     def test_選択中でない判断の取り下げでも終了確認が残らない(self):

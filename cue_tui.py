@@ -295,14 +295,19 @@ class Desk:
             self.load_error = f'更新できません: {error}。r で再試行できます'
             return
         old_ids = {item['id'] for item in self.items}
+        defaults = {item['id']: item['options'][0]['id'] for item in self.items}
         self.items, self.load_error = fresh, ''
         options = {item['id']: {option['id'] for option in item['options']} for item in fresh}
         for identifier in list(self.drafts):
+            draft = self.drafts[identifier]
             # 取り下げで消えた判断の下書きを残すと dirty() が終了確認を出し続ける
             if identifier not in options:
                 del self.drafts[identifier]
-            elif self.drafts[identifier]['choice'] not in options[identifier]:
-                self.drafts[identifier]['choice'] = None
+            elif not draft['memo'] and draft['choice'] == defaults.get(identifier):
+                # 触っていない既定値は update で先頭が変わっても未編集のまま新しい先頭へ合わせる
+                draft['choice'] = next(item['options'][0]['id'] for item in fresh if item['id'] == identifier)
+            elif draft['choice'] not in options[identifier]:
+                draft['choice'] = None
         if self.item is not None:
             previous = self.item
             current = next((item for item in fresh if item['id'] == previous['id']), None)
