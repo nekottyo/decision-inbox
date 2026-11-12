@@ -2,6 +2,7 @@
 import curses
 import locale
 import os
+from datetime import datetime
 from pathlib import Path
 import shlex
 import subprocess
@@ -10,6 +11,8 @@ import time
 import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import webbrowser
+
+from app import LANES
 
 PRIORITIES = {'urgent': 'すぐ判断', 'normal': '通常', 'later': 'あとでよい'}
 STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了', 'blocked': '承認・条件待ち', 'failed': '失敗'}
@@ -132,6 +135,7 @@ class Desk:
         self.notice, self.load_error = '', ''
         self.mode, self.menu_index = None, 0
         self.jump_choice = False
+        self.tasks, self.task_scroll = [], 0
         self.heading_styles = {}
         self.refresh()
 
@@ -140,13 +144,18 @@ class Desk:
         return sorted(items, key=lambda item: (list(PRIORITIES).index(item['priority']), item['created_at'], item['id']))
 
     def refresh(self):
+        # task の失敗で判断の表示を止めない
+        try:
+            self.tasks, task_error = self.store.tasks(), ''
+        except Exception as error:
+            self.tasks, task_error = [], f'task を読み込めません: {error}'
         try:
             fresh = self.store.list()
         except Exception as error:
-            self.load_error = f'更新できません: {error}。r で再試行できます'
+            self.load_error = f'更新できません: {error}。r で再試行できます {task_error}'.strip()
             return
         old_ids = {item['id'] for item in self.items}
-        self.items, self.load_error = fresh, ''
+        self.items, self.load_error = fresh, task_error
         if self.item is not None:
             previous_answer = self.item['answer']
             current = next((item for item in fresh if item['id'] == self.item['id']), None)
@@ -367,6 +376,23 @@ def detail_lines(desk, columns):
     return lines, choice_positions
 
 
+def task_lines(desk, columns):
+    counts = {key: sum(task['lane'] == key for task in desk.tasks) for key in LANES}
+    order = ('human_decision', 'human_action', 'worker', 'todo', 'done')
+    lines = [' / '.join(f'{LANES[key]} {counts[key]}' for key in order)]
+    for key, label in LANES.items():
+        lines.append(f'■ {label} ({counts[key]})')
+        for task in desk.tasks:
+            if task['lane'] != key:
+                continue
+            lines.append(f"  {task['title']}")
+            updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
+            parts = [f"担当 {task['pane']} {task['run']}".strip() if task['pane'] or task['run'] else '']
+            parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '', f'更新 {updated}']
+            lines.append('    ' + ' / '.join(part for part in parts if part))
+    return lines
+
+
 def draw(screen, desk):
     screen.erase()
     rows, columns = screen.getmaxyx()
@@ -423,7 +449,7 @@ def draw(screen, desk):
     message = desk.load_error or desk.notice
     put(rows - 4, 1, message, curses.A_BOLD)
     put(rows - 3, 1, '↑↓ 選択  Enter 確定  ←→ 案件  m メモ  PgUp/PgDn スクロール')
-    put(rows - 2, 1, 'Esc 閉じる  Tab 待ち/済み  u 取消  t 再処理  f 優先度  w Web  o リンク  ? ヘルプ')
+    put(rows - 2, 1, 'Esc 閉じる  Tab 待ち/済み  u 取消  t 再処理  f 優先度  w Web  o リンク  b task  ? ヘルプ')
     if desk.mode:
         screen.erase()
         if desk.mode == 'quit':
@@ -431,6 +457,14 @@ def draw(screen, desk):
             for index, label in enumerate(('戻る', '破棄して閉じる')):
                 put(4 + index * 2, 2, label, curses.A_REVERSE if desk.menu_index == index else 0)
             put(rows - 2, 2, '↑↓ / ←→で選択、Enter で決定、Esc で閉じる')
+        elif desk.mode == 'tasks':
+            put(0, 2, 'task  ' + task_lines(desk, columns)[0], curses.A_BOLD)
+            lines = task_lines(desk, columns)[1:]
+            visible = max(1, rows - 3)
+            desk.task_scroll = min(max(0, desk.task_scroll), max(0, len(lines) - visible))
+            for offset, value in enumerate(lines[desk.task_scroll:desk.task_scroll + visible]):
+                put(1 + offset, 2, value)
+            put(rows - 1, 2, '↑↓ スクロール / b で戻る')
         elif desk.mode == 'links':
             put(1, 2, '関連リンクを開く', curses.A_BOLD)
             visible = max(1, (rows - 5) // 2)
@@ -439,7 +473,7 @@ def draw(screen, desk):
                 put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
             put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で閉じる')
         else:
-            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
+            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'b: task (依頼の進み具合) を読み取り専用で表示', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
             for index, line in enumerate(help_lines):
                 put(index + 1, 2, line, curses.A_BOLD if index == 0 else 0)
     screen.noutrefresh()
@@ -451,7 +485,14 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
     if key == '\x1b':
         return False
     if desk.mode:
-        if desk.mode == 'help':
+        if desk.mode == 'tasks':
+            if key in ('b', '\n', '\r', curses.KEY_ENTER, 'q', '?'):
+                desk.mode = None
+            elif key in (curses.KEY_UP, 'k'):
+                desk.task_scroll = max(0, desk.task_scroll - 1)
+            elif key in (curses.KEY_DOWN, 'j'):
+                desk.task_scroll += 1
+        elif desk.mode == 'help':
             if key in ('\n', '\r', curses.KEY_ENTER, '?', 'q'):
                 desk.mode = None
         elif key in (curses.KEY_UP, curses.KEY_LEFT, 'k'):
@@ -510,6 +551,9 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
             desk.notice = '関連リンクはありません'
     elif key == '?':
         desk.mode = 'help'
+    elif key == 'b':
+        desk.refresh()
+        desk.mode, desk.task_scroll = 'tasks', 0
     elif key == 'm':
         if desk.item and desk.item['answer'] is None:
             try:

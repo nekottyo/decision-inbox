@@ -70,7 +70,14 @@ python3 app.py --db /tmp/decision-test.sqlite3 renew --id ID --token TOKEN --lea
 python3 app.py --db /tmp/decision-test.sqlite3 report --id ID --token TOKEN --status blocked --reason "承認が必要" --next-step "承認後に再試行"
 python3 app.py --db /tmp/decision-test.sqlite3 retry --id ID --decided-at ANSWER_TIMESTAMP --reported-at REPORT_TIMESTAMP
 python3 app.py --db /tmp/decision-test.sqlite3 backup --output /tmp/decision-backup.sqlite3
+python3 app.py --db /tmp/decision-test.sqlite3 task add --id ID --title 題名 [--request R] [--pane P] [--run RUN] [--result R] [--remaining R] [--lane L] [--decision DECISION_ID]
+python3 app.py --db /tmp/decision-test.sqlite3 task move --id ID --lane worker
+python3 app.py --db /tmp/decision-test.sqlite3 task update --id ID [--title T] [--result R] [--remaining R] [--decision DECISION_ID]
+python3 app.py --db /tmp/decision-test.sqlite3 task delete --id ID
+python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 ```
+
+`task` は依頼の進み具合を管理する CLI 専用の機能で、HTTP API と Web には出ない。lane は `todo` / `human_decision` / `worker` / `human_action` / `done`。`add` は同じ id・同じ内容なら既存を返し、内容が違えば 409。`update` は指定した項目だけを変え、空文字で消去する (`--decision` の空文字は関連付けの解除)。`list --json` は `{"lanes":[{"id","label","tasks":[...]}]}` を返し、`--json` なしは lane ごとの文字の一覧を出す。task 系は DB を書き込み可で開くため、tasks 表が無い DB には表を足す (`PRAGMA user_version` は 2 のまま)。
 
 `tui`、`watch`、`backup` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
 
