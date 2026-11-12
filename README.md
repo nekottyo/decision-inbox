@@ -87,7 +87,7 @@ python3 app.py task delete --id fix-login
 
 - lane: `todo` (未着手) / `human_decision` (人の判断待ち) / `worker` (worker 作業中) / `human_action` (人の操作待ち) / `done` (完了)
 
-TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担当 pane へ移ります。別 session の pane へ端末ごと移るには tmux が要ります。tmux が無いときは focus だけ行い、その旨を 1 行出します。herdr の popup では移れたら TUI を閉じますが、この 1 行が出たときは閉じません。`b` で戻ります。Web では上部の「task」で lane 別の一覧を読み取り専用で開けます (`/?view=tasks`)。判断にひも付く task は、判断の題名と未回答 / 回答済みを Web・`task list`・TUI のどれでも表示し、Web では判断の画面へ移れます。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
+TUI では `b` で一覧を開き、↑↓ で task を選択し、Enter で担当 pane へ移ります。別 session の pane へ端末ごと移るには tmux が要ります。tmux が無いときは focus だけ行い、その旨を 1 行出します。herdr の popup では移れたら TUI を閉じますが、この 1 行が出たときは閉じません。`b` で戻ります。Web では上部の「task」で lane 別の一覧を読み取り専用で開けます (`/?view=tasks`)。判断にひも付く task は、判断の題名と未回答 / 回答済み / 取り下げを Web・`task list`・TUI のどれでも表示し、Web では判断の画面へ移れます。`PRAGMA user_version` は 2 のままなので、旧 release に戻してもそのまま動きます (tasks 表は無視されます)。
 
 ## 配置と更新
 
@@ -133,6 +133,16 @@ python3 app.py complete --id DECISION_ID --token CLAIM_TOKEN
 Web で回答すると「処理待ち」になり、claim で「対応中」、complete で「完了」になります。回答内容・メモ・状態は SQLite に保存され、再読み込みや server 再起動後も残ります。二重回答は拒否し、上書きしません。API と任意画像・期限等の全 payload は [API.md](API.md) を参照してください。
 
 再送する依頼には元依頼ごとに一定の `request_key` を付けてください。同じキーと同じ内容なら既存の案件を返し、同じキーで内容が異なる場合は競合として拒否します。キーなしは毎回新しい案件になるため、再収集や通知の再配送では元のキーを引き継いでください。
+
+回答前に事情が変わったら、依頼元は判断を更新または取り下げられます。理由は `--note` に書きます。
+
+```sh
+python3 app.py update --id DECISION_ID --note "期限が決まった" --file changes.json
+python3 app.py withdraw --id DECISION_ID --note "別の方法で解決した"
+python3 app.py list --include-withdrawn
+```
+
+`changes.json` は変える項目だけの JSON オブジェクトで、`request_key` は変えられません。更新すると Web と TUI の一覧・詳細に「更新あり」と理由が出て、表示中の人にも知らせます。表示後に更新された判断への回答は、最新の内容を確認するよう拒否します。取り下げた判断は `list` と画面から消え、回答できなくなります (`GET /api/decisions/{id}` と `list --include-withdrawn` では見えます)。どちらも未回答の判断だけが対象で、回答済み (claim 中を含む) は拒否します。claim 中の判断は token を持つ worker が report または complete で閉じてください。旧 release に戻すと、取り下げた判断が未回答として再表示されます。
 
 `app.py` は実行可能な CLI entry point です。窓口側で symlink を設置した環境では、上記の `python3 app.py` を `decision-inbox` に置き換えられます。この repo 自体は symlink の設置や harness の起動を行いません。
 

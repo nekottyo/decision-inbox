@@ -296,16 +296,35 @@ class Desk:
             return
         old_ids = {item['id'] for item in self.items}
         self.items, self.load_error = fresh, ''
+        options = {item['id']: {option['id'] for option in item['options']} for item in fresh}
+        for identifier in list(self.drafts):
+            # 取り下げで消えた判断の下書きを残すと dirty() が終了確認を出し続ける
+            if identifier not in options:
+                del self.drafts[identifier]
+            elif self.drafts[identifier]['choice'] not in options[identifier]:
+                self.drafts[identifier]['choice'] = None
         if self.item is not None:
-            previous_answer = self.item['answer']
-            current = next((item for item in fresh if item['id'] == self.item['id']), None)
-            if current is not None:
+            previous = self.item
+            current = next((item for item in fresh if item['id'] == previous['id']), None)
+            if current is None:
+                try:
+                    gone = self.store.get(previous['id'])
+                except Exception:
+                    gone = None
+                self.item, self.scroll = None, 0
+                if self.visible():
+                    self.select(self.visible()[0])
+                if gone and gone['withdrawn']:
+                    self.notice = f"この判断は取り下げられました: {gone['withdrawn']['note']}"
+            else:
                 self.item = current
-                if previous_answer is None and current['answer'] is not None:
+                if previous['answer'] is None and current['answer'] is not None:
                     self.notice = '別の画面で判断済みです。下書きは保持しています。←→で案件を移動できます'
-                elif previous_answer is not None and current['answer'] is None:
+                elif previous['answer'] is not None and current['answer'] is None:
                     self.view = 'pending'
                     self.notice = '回答が取り消され、判断待ちへ戻りました。下書きは保持しています'
+                elif current['answer'] is None and current['revision'] > previous['revision']:
+                    self.notice = f"内容が更新されました: {current['update_note']}。最新の内容を表示しています"
         elif self.visible():
             self.select(self.visible()[0])
         if old_ids and {item['id'] for item in fresh} - old_ids and not self.notice:
@@ -403,7 +422,7 @@ class Desk:
             return
         identifier = self.item['id']
         try:
-            saved = self.store.answer(identifier, dict(draft))
+            saved = self.store.answer(identifier, {**draft, 'revision': self.item['revision']})
         except Exception as error:
             self.notice = f'保存できません: {error}。入力は保持しています'
             return
@@ -487,6 +506,9 @@ def detail_lines(desk, columns):
     append(item['title'], curses.A_BOLD)
     status = STATUSES.get(item['answer']['status'], '判断済み') if item['answer'] else '判断待ち'
     append(f"[{PRIORITIES[item['priority']]}] {status}")
+    if item['revision']:
+        heading(f"更新あり  {item['updated_at']}", 'stopped')
+        append(item['update_note'])
     if item['answer']:
         answer = item['answer']
         if answer.get('reason'):
@@ -571,7 +593,8 @@ def task_lines(desk, columns):
             lines.append(('    ' + ' / '.join(part for part in parts if part), 0))
             if task['decision_id']:
                 decision = task['decision']
-                lines.append((f'    判断 {decision_text(task)}', answered if decision and decision['answered'] else waiting))
+                # 取り下げは人の判断を待っていないので、回答済みと同じ落ち着いた色にする
+                lines.append((f'    判断 {decision_text(task)}', answered if decision and (decision['answered'] or decision['withdrawn']) else waiting))
             if task['id'] == desk.task_id:
                 selected = (start, len(lines) - 1)
     return lines, selected
@@ -616,7 +639,7 @@ def draw(screen, desk):
         for index, item in enumerate(items[first:first + body_height // 3]):
             active = desk.item and item['id'] == desk.item['id']
             attribute = curses.A_REVERSE if active else 0
-            put(3 + index * 3, 1, f"[{PRIORITIES[item['priority']]}]", attribute, sidebar - 2)
+            put(3 + index * 3, 1, f"[{PRIORITIES[item['priority']]}]" + (' 更新あり' if item['revision'] else ''), attribute, sidebar - 2)
             put(4 + index * 3, 1, item['title'], attribute, sidebar - 2)
     elif desk.item:
         index = next((index for index, item in enumerate(items) if item['id'] == desk.item['id']), None)

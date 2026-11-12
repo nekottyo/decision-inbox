@@ -98,8 +98,9 @@ export default function DecisionDesk({
           <div className="list-heading"><h2 id="list-title">{view === 'pending' ? '判断待ち' : '判断済み'}</h2><span>優先度順・受付順</span></div>
           <ul id="case-list" className="case-list" aria-busy={loading}>
             {items.map(candidate => <li key={candidate.id}><button type="button" className="case-button" data-case={candidate.id} aria-current={candidate.id === item?.id ? 'true' : undefined} disabled={saving} onClick={() => onSelect(candidate.id)}>
-              <span className="case-topline"><PriorityBadge priority={candidate.priority} /></span>
+              <span className="case-topline"><PriorityBadge priority={candidate.priority} />{candidate.revision > 0 && <Badge label="更新あり" variant="info" />}</span>
               <span className="case-title">{candidate.title}</span>
+              {candidate.revision > 0 && <span className="case-update">{candidate.update_note}</span>}
               <span className="case-meta">{candidate.source}<br /><time dateTime={candidate.created_at}>{dateText(candidate.created_at)}</time></span>
               {candidate.answer && <span className="case-answer">回答：{answerTitle(candidate)}<br />後続処理：{statuses[candidate.answer.status]}</span>}
             </button></li>)}
@@ -113,6 +114,7 @@ export default function DecisionDesk({
               <h2>{item.title}</h2>
               <p className="source">依頼元：{item.source}<span>受付 <time dateTime={item.created_at}>{dateText(item.created_at)}</time></span></p>
               {timing && <p className={`deadline ${item.priority}`}>{timing}</p>}
+              {item.revision > 0 && <p id="update-note" className="update-note"><Badge label="更新あり" variant="info" /><span>{item.update_note}</span><time dateTime={item.updated_at}>{dateText(item.updated_at)}</time></p>}
             </header>
             {item.answer && <RecordedAnswer item={item} saving={saving} onUndo={onUndo} onRetry={onRetry} />}
             <section className="context" aria-labelledby="why-heading"><h3 id="why-heading">判断が必要な理由</h3><p className="reason">{item.reason}</p></section>

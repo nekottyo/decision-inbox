@@ -29,14 +29,27 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 
 必須は `title/source/reason/options/recommended/recommendation`。`priority` の既定は `normal`、`background/urgency_reason` は空文字、`links` は空配列、`deadline/image` は null。候補は 2〜8 件で重複しない ID。priority は `urgent/normal/later`。deadline は timezone 付き ISO 8601。リンクは http(s) URL、kind は `pr/issue/other`、label 必須。image は `{"url":"https://example.com/diagram.png","alt":"図の説明"}` または許可済み `/assets/` 内の静的画像参照。任意 HTML は受け付けない。body 上限は 128 KiB。title/source は 200 文字、reason/recommendation は 4000 文字、background は 12000 文字、urgency_reason は 2000 文字、memo は 2000 文字、リンクは 20 件まで。未知の項目・重複 JSON キーは拒否。
 
-任意の `request_key` は 1〜200 文字の英数字と `_ . : / -` で指定。同じキーかつ既定値補完後の同一 JSON 内容なら同じ ID を返す。同じキーで内容が異なれば `409`。JSON オブジェクトのキー順は問わず、候補やリンクの配列順は内容の一部として扱う。キーなしは従来どおり毎回登録する。
+任意の `request_key` は 1〜200 文字の英数字と `_ . : / -` で指定。同じキーかつ既定値補完後の同一 JSON 内容なら同じ ID を返す。同じキーで内容が異なれば `409`。JSON オブジェクトのキー順は問わず、候補やリンクの配列順は内容の一部として扱う。キーなしは従来どおり毎回登録する。update 済みの判断には、現在の内容に加えて update 前のどの内容で再送しても同じ ID を返す。取り下げ済みの判断と同じキーで add すると `409` (置き換えるときは新しい request_key で add する)。
+
+## 未回答の判断の更新と取り下げ
+
+- `POST /api/decisions/{id}/update`、body `{"note":"更新の理由","changes":{"deadline":"2026-12-01T00:00:00+09:00"}}` → 更新後の依頼全体
+- `POST /api/decisions/{id}/withdraw`、body `{"note":"取り下げの理由"}` → 取り下げ後の依頼全体
+
+理由は依頼側の `reason` や report の `reason` と分けるため `note` (1〜2000 文字) と呼ぶ。`changes` は登録時の項目 (title/source/reason/background/priority/urgency_reason/deadline/options/recommended/recommendation/links/image) の部分集合で、現在の内容に重ねてから登録時と同じ検査をする。`request_key` は変更できず `400`。重ねた結果が現在と同じなら revision を上げずに現在の依頼全体を返す。回答済み・取り下げ済みの判断の update は `409`。変更前の内容は DB の `decision_changes` に残る。
+
+withdraw は未回答の判断だけを対象にし、DB から行は消さない。取り下げ済みへの再送は同じ結果を `200` で返す。回答済み (claim 中・処理中・完了・停止を含む) は `409`。claim は回答済みしか拾わないため、未回答の取り下げと処理中の worker は重ならない。claim 中の判断を止めたいときは、token を持つ worker が report または complete で閉じる。
+
+依頼全体には `revision` (update の回数、0 始まり)、`updated_at`/`update_note` (最新の update、無ければ null)、`withdrawn` (取り下げ済みなら `{"note":"...","withdrawn_at":"UTC ISO 8601"}`、それ以外は null) が付く。`GET /api/decisions` と CLI `list` は取り下げ済みを返さない (`answer:null` を未判断として扱えるようにするため)。CLI `list --include-withdrawn` で含める。`GET /api/decisions/{id}` は取り下げ済みも返す。
+
+旧 release は `decision_changes` を読まないため、旧 release に戻すと取り下げ済みの判断が未回答として再表示され、更新の履歴も表示されない。
 
 ## 一覧・詳細・判断
 
 - `GET /api/decisions` → `{"decisions":[依頼全体...],"demo":false}`
 - `GET /api/decisions/{id}` → 依頼全体
 - `GET /api/tasks` → `{"lanes":[...]}` (`task list --json` と同じ形)
-- `POST /api/decisions/{id}/answer`、body `{"choice":"minimal","memo":"任意のメモ"}` → 保存後の依頼全体
+- `POST /api/decisions/{id}/answer`、body `{"choice":"minimal","memo":"任意のメモ","revision":0}` → 保存後の依頼全体。任意の `revision` は表示中の依頼全体の値で、現在の revision と違えば `409` (表示後に内容が更新された)。取り下げ済みは `409`
 
 依頼全体は登録内容に `id/created_at/answer` を加えたもの。未判断の `answer` は null。判断済みは `{"choice":"minimal","memo":"...","decided_at":"UTC ISO 8601","status":"pending","reason":"","next_step":"","reported_at":null,"can_undo":true}`。status は `pending/processing/completed/blocked/failed`。`reason/next_step` は consumer の停止理由と次の操作で、依頼側の `reason` とは別。`reported_at` は停止報告の時刻で、停止していなければ null。二重判断は `409`、入力は上書きしない。
 
@@ -61,7 +74,9 @@ lease_seconds は省略時 300、1〜3600 秒。front-desk は 3600 秒を指定
 ```sh
 python3 app.py --db /tmp/decision-test.sqlite3 serve --port 4317
 python3 app.py --db /tmp/decision-test.sqlite3 add --file request.json
-python3 app.py --db /tmp/decision-test.sqlite3 list
+python3 app.py --db /tmp/decision-test.sqlite3 list [--include-withdrawn]
+python3 app.py --db /tmp/decision-test.sqlite3 update --id ID --note "更新の理由" --file changes.json
+python3 app.py --db /tmp/decision-test.sqlite3 withdraw --id ID --note "取り下げの理由"
 python3 app.py --db /tmp/decision-test.sqlite3 watch --interval 2 --timeout 1740
 python3 app.py --db /tmp/decision-test.sqlite3 tui --web-url http://127.0.0.1:4317/
 python3 app.py --db /tmp/decision-test.sqlite3 claim --worker front-desk --lease-seconds 300
@@ -78,7 +93,7 @@ python3 app.py --db /tmp/decision-test.sqlite3 task delete --id ID
 python3 app.py --db /tmp/decision-test.sqlite3 task list [--lane L] [--json]
 ```
 
-`task` は依頼の進み具合を管理する機能で、書き込みは CLI だけが行う。HTTP は一覧の `GET /api/tasks` (`list --json` と同じ形) だけを出し、Web の task 画面はこれを読み取り専用で表示する。lane は `todo` / `human_decision` / `worker` / `human_action` / `done`。`add` は同じ id で登録内容 (title / request / pane / run) が同じなら既存を返し、違えば 409。lane / result / remaining / decision_id は move / update で進むため比べず、再送しても既存の値は変わらない。`--decision` は 32 桁 hex 以外を 400、存在しない判断を 404 にする。不正な `--lane` は `list` / `list --json` / `add` / `move` とも 400。`update` は指定した項目だけを変え、空文字で消去する (`--decision` の空文字は関連付けの解除)。`list --json` は `{"lanes":[{"id","label","tasks":[...]}]}` を返し、各 task の `decision` は判断が無ければ null、あれば `{"title":"判断の題名","answered":false}` (判断 ID が残っていて判断が見つからないときも null)。`--json` なしは lane ごとの文字の一覧を出す。task 系は DB を書き込み可で開くため、tasks 表が無い DB には表を足す (`PRAGMA user_version` は 2 のまま)。
+`task` は依頼の進み具合を管理する機能で、書き込みは CLI だけが行う。HTTP は一覧の `GET /api/tasks` (`list --json` と同じ形) だけを出し、Web の task 画面はこれを読み取り専用で表示する。lane は `todo` / `human_decision` / `worker` / `human_action` / `done`。`add` は同じ id で登録内容 (title / request / pane / run) が同じなら既存を返し、違えば 409。lane / result / remaining / decision_id は move / update で進むため比べず、再送しても既存の値は変わらない。`--decision` は 32 桁 hex 以外を 400、存在しない判断を 404 にする。不正な `--lane` は `list` / `list --json` / `add` / `move` とも 400。`update` は指定した項目だけを変え、空文字で消去する (`--decision` の空文字は関連付けの解除)。`list --json` は `{"lanes":[{"id","label","tasks":[...]}]}` を返し、各 task の `decision` は判断が無ければ null、あれば `{"title":"判断の題名","answered":false,"withdrawn":false}` (判断 ID が残っていて判断が見つからないときも null)。`--json` なしは lane ごとの文字の一覧を出す。task 系は DB を書き込み可で開くため、tasks 表が無い DB には表を足す (`PRAGMA user_version` は 2 のまま)。
 
 `tui`、`watch`、`backup`、`task` を除く CLI は対応する API と同じ JSON を stdout に返す。エラーは stderr と非ゼロ終了。既定 DB は `--db`、環境変数 `DECISION_INBOX_DB`、repo 外の user data directory の順で決定。`app.py` は executable で、PATH 上の symlink 経由でも同じ CLI を利用可能。`serve --demo` は別の一時 DB にデモだけを投入し、実 DB を使用しない。server は `127.0.0.1` のみ、`--port 0` は空きポートを選び起動 URL を出力。
 

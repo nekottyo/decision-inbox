@@ -124,6 +124,10 @@ def validate_request(payload):
     return item
 
 
+def canonical(item):
+    return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
 def validate_task(payload):
     """payload に入った項目だけを検査して返す。decision_id の存在確認は Store.check_decision が行う"""
     item = {}
@@ -235,6 +239,12 @@ class Store:
                 pane TEXT NOT NULL DEFAULT '', run TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
                 remaining TEXT NOT NULL DEFAULT '', lane TEXT NOT NULL, decision_id TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+            # 更新・取り下げは decisions に列を足さず別表に積む。decisions の列や状態の CHECK を変えると
+            # 旧 release が開けなくなるため。取り下げ済み = withdraw 行があること。旧 release に戻すと
+            # この表は読まれず、取り下げ済みの判断が未回答として再表示される
+            connection.execute('''CREATE TABLE IF NOT EXISTS decision_changes (
+                id INTEGER PRIMARY KEY, decision_id TEXT NOT NULL, event TEXT NOT NULL,
+                recorded_at TEXT NOT NULL, note TEXT NOT NULL, before TEXT)''')
             if version != 2:
                 connection.execute('PRAGMA user_version=2')
 
@@ -283,11 +293,28 @@ class Store:
                     pass
         return {'backup': str(output)}
 
-    def public(self, row):
+    def changes(self, connection, identifier=None):
+        """decision_id ごとの decision_changes の行 (記録順)。identifier が無ければ全件"""
+        where, params = (' WHERE decision_id=?', (identifier,)) if identifier else ('', ())
+        found = {}
+        # TUI が毎秒呼ぶ list() で変更前の payload まで読まないよう before は引かない
+        for row in connection.execute('SELECT decision_id,event,recorded_at,note FROM decision_changes' + where + ' ORDER BY id', params):
+            found.setdefault(row['decision_id'], []).append(row)
+        return found
+
+    def fetch(self, connection, identifier):
+        row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+        return self.public(row, self.changes(connection, identifier).get(identifier, []))
+
+    def public(self, row, changes):
         if row is None:
             raise AppError(404, '案件が見つかりません')
         item = json.loads(row['payload'])
-        item.update(id=row['id'], created_at=row['created_at'], answer=None)
+        updates = [change for change in changes if change['event'] == 'update']
+        withdrawn = next((change for change in changes if change['event'] == 'withdraw'), None)
+        item.update(id=row['id'], created_at=row['created_at'], answer=None, revision=len(updates),
+                    updated_at=updates[-1]['recorded_at'] if updates else None, update_note=updates[-1]['note'] if updates else None,
+                    withdrawn={'note': withdrawn['note'], 'withdrawn_at': withdrawn['recorded_at']} if withdrawn else None)
         if row['choice'] is not None:
             item['answer'] = {
                 'choice': row['choice'], 'memo': row['memo'], 'decided_at': row['decided_at'], 'status': row['status'],
@@ -306,10 +333,10 @@ class Store:
 
     def record(self, connection, row, event):
         connection.execute('INSERT INTO answer_history(decision_id,event,recorded_at,answer) VALUES(?,?,?,?)',
-                           (row['id'], event, self.stamp(connection, row['id'], max(row['decided_at'] or '', row['reported_at'] or '')), json.dumps(self.public(row)['answer'], ensure_ascii=False)))
+                           (row['id'], event, self.stamp(connection, row['id'], max(row['decided_at'] or '', row['reported_at'] or '')), json.dumps(self.public(row, [])['answer'], ensure_ascii=False)))
 
     def active(self, row, token):
-        self.public(row)
+        self.public(row, [])
         text(token, 'token', 200)
         now = time.time()
         if not token.isascii() or row['status'] != 'processing' or not row['token'] or not secrets.compare_digest(row['token'], token) or row['lease_until'] is None or row['lease_until'] <= now:
@@ -318,22 +345,30 @@ class Store:
 
     def add(self, payload):
         item = validate_request(payload)
-        canonical = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        expected = canonical(item)
         identifier = uuid.uuid4().hex
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             if 'request_key' in item:
                 row = connection.execute('SELECT * FROM decisions WHERE request_key=?', (item['request_key'],)).fetchone()
                 if row:
-                    if json.dumps(json.loads(row['payload']), ensure_ascii=False, sort_keys=True, separators=(',', ':')) != canonical:
+                    changes = self.changes(connection, row['id']).get(row['id'], [])
+                    if any(change['event'] == 'withdraw' for change in changes):
+                        raise AppError(409, 'この request_key の判断は取り下げ済みです。置き換えるときは新しい request_key で add してください')
+                    # update 前の内容での再送も同じ依頼として受ける
+                    known = [row['payload']] + [value for value, in connection.execute("SELECT before FROM decision_changes WHERE decision_id=? AND event='update'", (row['id'],))]
+                    if expected not in [canonical(json.loads(value)) for value in known]:
                         raise AppError(409, '同じ request_key に異なる依頼が登録されています')
-                    return self.public(row)
-            connection.execute('INSERT INTO decisions(id,created_at,payload,request_key) VALUES(?,?,?,?)', (identifier, utc_now(), canonical, item.get('request_key')))
+                    return self.public(row, changes)
+            connection.execute('INSERT INTO decisions(id,created_at,payload,request_key) VALUES(?,?,?,?)', (identifier, utc_now(), expected, item.get('request_key')))
         return self.get(identifier)
 
-    def list(self):
+    def list(self, include_withdrawn=False):
         with self.db() as connection:
-            return [self.public(row) for row in connection.execute('SELECT * FROM decisions ORDER BY created_at,id')]
+            changes = self.changes(connection)
+            items = [self.public(row, changes.get(row['id'], [])) for row in connection.execute('SELECT * FROM decisions ORDER BY created_at,id')]
+        # 窓口は answer が null の判断を未判断として人に案内するため、取り下げ済みは既定で外す
+        return [item for item in items if include_withdrawn or item['withdrawn'] is None]
 
     def ready(self, key_prefix=None):
         clause, params = prefix_clause(key_prefix)
@@ -342,18 +377,24 @@ class Store:
 
     def get(self, identifier):
         with self.db() as connection:
-            return self.public(connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone())
+            return self.fetch(connection, identifier)
 
     def answer(self, identifier, payload):
-        object_fields(payload, ('choice',), ('memo',))
+        object_fields(payload, ('choice',), ('memo', 'revision'))
         choice = text(payload['choice'], '回答', 64)
         memo = text(payload.get('memo', ''), 'メモ', 2000, empty=True)
+        revision = payload.get('revision')
+        if revision is not None and (type(revision) is not int or revision < 0):
+            raise AppError(400, 'revision は 0 以上の整数を指定してください')
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
-            item = self.public(row)
+            item = self.fetch(connection, identifier)
+            if item['withdrawn'] is not None:
+                raise AppError(409, 'この判断は取り下げられました')
             if item['answer'] is not None:
                 raise AppError(409, '別の画面で判断済みです。入力は保存していません')
+            if revision is not None and revision != item['revision']:
+                raise AppError(409, '内容が更新されています。最新の内容を確認してから回答してください')
             if choice not in {option['id'] for option in item['options']}:
                 raise AppError(400, '選択した候補が見つかりません')
             connection.execute("UPDATE decisions SET choice=?,memo=?,decided_at=?,status='pending' WHERE id=? AND choice IS NULL", (choice, memo, self.stamp(connection, identifier), identifier))
@@ -365,12 +406,49 @@ class Store:
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
-            answer = self.public(row)['answer']
+            answer = self.public(row, [])['answer']
             if not answer or not answer['can_undo'] or row['decided_at'] != expected:
                 raise AppError(409, '回答が変更済み、または処理開始済みのため取り消せません')
             self.record(connection, row, 'undo')
             connection.execute('UPDATE decisions SET choice=NULL,memo=NULL,decided_at=NULL,status=NULL WHERE id=?', (identifier,))
         return self.get(identifier)
+
+    def update(self, identifier, payload):
+        object_fields(payload, ('note', 'changes'))
+        note = text(payload['note'], 'note', 2000)
+        changes = payload['changes']
+        if isinstance(changes, dict) and 'request_key' in changes:
+            raise AppError(400, 'request_key は変更できません。別の依頼は新しい request_key で add してください')
+        object_fields(changes, (), ('title', 'source', 'reason', 'background', 'priority', 'urgency_reason', 'deadline', 'options', 'recommended', 'recommendation', 'links', 'image'))
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
+            item = self.public(row, self.changes(connection, identifier).get(identifier, []))
+            if item['withdrawn'] is not None:
+                raise AppError(409, 'この判断は取り下げ済みのため更新できません')
+            if item['answer'] is not None:
+                raise AppError(409, '回答済みの判断は更新できません。回答を確認してください')
+            before = canonical(json.loads(row['payload']))
+            after = canonical(validate_request({**json.loads(row['payload']), **changes}))
+            if after == before:
+                return item
+            connection.execute('UPDATE decisions SET payload=? WHERE id=? AND choice IS NULL', (after, identifier))
+            connection.execute("INSERT INTO decision_changes(decision_id,event,recorded_at,note,before) VALUES(?,'update',?,?,?)", (identifier, utc_now(), note, before))
+            return self.fetch(connection, identifier)
+
+    def withdraw(self, identifier, payload):
+        object_fields(payload, ('note',))
+        note = text(payload['note'], 'note', 2000)
+        with self.db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            item = self.fetch(connection, identifier)
+            if item['withdrawn'] is not None:
+                return item
+            # claim は回答済みしか拾わないので、未回答に限れば処理中の worker と重ならない
+            if item['answer'] is not None:
+                raise AppError(409, '回答済みの判断は取り下げられません。claim 中なら token を持つ worker が report または complete で閉じてください')
+            connection.execute("INSERT INTO decision_changes(decision_id,event,recorded_at,note) VALUES(?,'withdraw',?,?)", (identifier, utc_now(), note))
+            return self.fetch(connection, identifier)
 
     def check_decision(self, connection, item):
         if item.get('decision_id') and not connection.execute('SELECT 1 FROM decisions WHERE id=?', (item['decision_id'],)).fetchone():
@@ -417,12 +495,13 @@ class Store:
         if lane is not None and lane not in LANES:
             raise AppError(400, 'lane は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
         with self.db() as connection:
-            rows = [dict(row) for row in connection.execute('''SELECT tasks.*, decisions.payload AS decision_payload, decisions.choice AS decision_choice
+            rows = [dict(row) for row in connection.execute('''SELECT tasks.*, decisions.payload AS decision_payload, decisions.choice AS decision_choice,
+                EXISTS(SELECT 1 FROM decision_changes WHERE decision_id=tasks.decision_id AND event='withdraw') AS decision_withdrawn
                 FROM tasks LEFT JOIN decisions ON decisions.id=tasks.decision_id ORDER BY tasks.created_at,tasks.id''')]
         # web / CLI / TUI が同じ形で判断の題名と回答の有無を出せるよう、ここで 1 度だけ引く
         for row in rows:
-            payload, choice = row.pop('decision_payload'), row.pop('decision_choice')
-            row['decision'] = {'title': json.loads(payload)['title'], 'answered': choice is not None} if payload else None
+            payload, choice, withdrawn = row.pop('decision_payload'), row.pop('decision_choice'), row.pop('decision_withdrawn')
+            row['decision'] = {'title': json.loads(payload)['title'], 'answered': choice is not None, 'withdrawn': bool(withdrawn)} if payload else None
         order = list(LANES)
         rows = [row for row in rows if lane is None or row['lane'] == lane]
         return sorted(rows, key=lambda row: order.index(row['lane']) if row['lane'] in order else len(order))
@@ -440,7 +519,7 @@ class Store:
             if row is None:
                 return {'decision': None}
             connection.execute("UPDATE decisions SET status='processing',worker=?,token=?,lease_until=? WHERE id=?", (worker, token, expires, row['id']))
-            decision = self.public(connection.execute('SELECT * FROM decisions WHERE id=?', (row['id'],)).fetchone())
+            decision = self.fetch(connection, row['id'])
         return {'decision': decision, 'token': token, 'worker': worker, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
 
     def report(self, identifier, payload):
@@ -465,7 +544,7 @@ class Store:
         with self.db() as connection:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone()
-            self.public(row)
+            self.public(row, [])
             if row['status'] not in ('blocked', 'failed') or row['decided_at'] != decided_at or row['reported_at'] != reported_at:
                 raise AppError(409, '停止理由が変更済み、または再試行できない状態です')
             self.record(connection, row, 'retry')
@@ -481,7 +560,7 @@ class Store:
             now = self.active(row, payload['token'])
             expires = max(row['lease_until'], now + seconds)
             connection.execute('UPDATE decisions SET lease_until=? WHERE id=?', (expires, identifier))
-            decision = self.public(connection.execute('SELECT * FROM decisions WHERE id=?', (identifier,)).fetchone())
+            decision = self.fetch(connection, identifier)
         return {'decision': decision, 'expires_at': datetime.fromtimestamp(expires, timezone.utc).isoformat()}
 
     def complete(self, identifier, token):
@@ -606,7 +685,7 @@ class Handler(BaseHTTPRequestHandler):
                         # null を未指定扱いにすると全件 claim になり、絞り込みが黙って外れる
                         raise AppError(400, 'key_prefix は文字列で指定してください')
                     return self.json_response(200, store.claim(payload['worker'], payload.get('lease_seconds', 300), payload.get('key_prefix')))
-                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|renew)', path)
+                match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})/(answer|complete|undo|report|retry|renew|update|withdraw)', path)
                 if match:
                     if match[2] == 'complete':
                         object_fields(payload, ('token',))
@@ -695,7 +774,8 @@ def decision_text(task):
     decision = task['decision']
     if decision is None:
         return f"{task['decision_id']} (見つかりません)"
-    return f"{'回答済み' if decision['answered'] else '未回答'} {decision['title']}  [{task['decision_id']}]"
+    state = '取り下げ' if decision['withdrawn'] else '回答済み' if decision['answered'] else '未回答'
+    return f"{state} {decision['title']}  [{task['decision_id']}]"
 
 
 def format_tasks(store, lane=None):
@@ -741,7 +821,15 @@ def main(argv=None):
     serve.add_argument('--demo', action='store_true')
     add = commands.add_parser('add')
     add.add_argument('--file', type=Path, required=True)
-    commands.add_parser('list')
+    listing = commands.add_parser('list')
+    listing.add_argument('--include-withdrawn', action='store_true')
+    update = commands.add_parser('update', help='未回答の判断の内容を差し替える')
+    update.add_argument('--id', required=True)
+    update.add_argument('--note', required=True)
+    update.add_argument('--file', type=Path, required=True, help='変更する項目だけの JSON オブジェクト')
+    withdraw = commands.add_parser('withdraw', help='未回答の判断を取り下げる')
+    withdraw.add_argument('--id', required=True)
+    withdraw.add_argument('--note', required=True)
     watch = commands.add_parser('watch', help='処理可能な回答の ID を JSONL で通知する')
     watch.add_argument('--interval', type=positive_seconds, default=2)
     watch.add_argument('--timeout', type=positive_seconds, default=1740)
@@ -823,14 +911,16 @@ def main(argv=None):
             return 0
         if args.command == 'watch':
             return watch_ready(store, args.interval, args.timeout, args.key_prefix)
-        if args.command == 'add':
+        if args.command in ('add', 'update'):
             with args.file.open('rb') as handle:
                 raw = handle.read(MAX_BODY + 1)
             if len(raw) > MAX_BODY:
                 raise AppError(413, '送信サイズが上限を超えています')
-            result = store.add(parse_json(raw))
+            result = store.add(parse_json(raw)) if args.command == 'add' else store.update(args.id, {'note': args.note, 'changes': parse_json(raw)})
+        elif args.command == 'withdraw':
+            result = store.withdraw(args.id, {'note': args.note})
         elif args.command == 'list':
-            result = {'decisions': store.list(), 'demo': False}
+            result = {'decisions': store.list(args.include_withdrawn), 'demo': False}
         elif args.command == 'claim':
             result = store.claim(args.worker, args.lease_seconds, args.key_prefix)
         elif args.command == 'undo':

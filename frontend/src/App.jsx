@@ -62,6 +62,7 @@ export default function App() {
           const changed = JSON.stringify(previous.cases) !== JSON.stringify(data.decisions);
           let view = previous.view;
           let selectedItem = previous.selectedItem;
+          let special = '';
           if (!selectedItem) {
             const linked = data.decisions.find(item => item.id === requestedDecision);
             if (linked) view = linked.answer ? 'done' : 'pending';
@@ -69,16 +70,32 @@ export default function App() {
           } else if (selectedItem.answer) {
             selectedItem = data.decisions.find(item => item.id === selectedItem.id) || selectedItem;
             if (!selectedItem.answer) view = 'pending';
+          } else {
+            // 一覧は取り下げ済みを返さないので、未回答の判断が消えたら取り下げとみなす
+            const latest = data.decisions.find(item => item.id === selectedItem.id);
+            if (!latest) {
+              drafts.current.delete(selectedItem.id);
+              selectedItem = null;
+              special = '表示中の判断は取り下げられました。';
+            } else if (!latest.answer && latest.revision > selectedItem.revision) {
+              selectedItem = latest;
+              special = `表示中の判断が更新されました: ${latest.update_note}`;
+            }
           }
           let notice = previous.notice;
-          if (!previous.loading && changed) {
+          if (special) notice = special;
+          else if (!previous.loading && changed) {
             const latest = data.decisions.find(item => item.id === selectedItem?.id);
             notice = selectedItem && !selectedItem.answer && JSON.stringify(latest) !== JSON.stringify(selectedItem)
               ? '表示中の案件に変更があります。入力を保持しています。一覧から案件を選び直すと最新の状態を確認できます。'
               : '新着または処理状態の変更があります。一覧を更新しました。';
           }
-          return {...previous, cases: data.decisions, view, selectedItem, loading: false, demo: data.demo, notice,
-            draft: selectedItem?.id === previous.selectedItem?.id ? previous.draft : drafts.current.get(selectedItem?.id) || emptyDraft(),
+          let draft = selectedItem?.id === previous.selectedItem?.id ? previous.draft : drafts.current.get(selectedItem?.id) || emptyDraft();
+          if (draft.choice && selectedItem && !selectedItem.options.some(option => option.id === draft.choice)) {
+            draft = {...draft, choice: ''};
+            drafts.current.set(selectedItem.id, draft);
+          }
+          return {...previous, cases: data.decisions, view, selectedItem, loading: false, demo: data.demo, notice, draft,
             error: previous.errorKind === 'load' ? '' : previous.error,
             errorKind: previous.errorKind === 'load' ? '' : previous.errorKind};
         });
@@ -183,7 +200,7 @@ export default function App() {
     version.current += 1;
     setState(previous => ({...previous, saving: true, error: '', errorKind: ''}));
     try {
-      const updated = await api(`/api/decisions/${encodeURIComponent(selectedItem.id)}/answer`, draft);
+      const updated = await api(`/api/decisions/${encodeURIComponent(selectedItem.id)}/answer`, {...draft, revision: selectedItem.revision});
       drafts.current.delete(updated.id);
       focusDetail.current = true;
       setState(previous => {
@@ -193,8 +210,9 @@ export default function App() {
           notice: `「${selectedItem.title}」の判断を保存しました。後続処理は「処理待ち」です。`};
       });
     } catch (error) {
+      // 409 は他画面の回答・内容の更新・取り下げで理由が違うので、サーバーの文言をそのまま出す
       setState(previous => ({...previous, errorKind: 'save', error: error.status === 409
-        ? 'この案件は別の画面ですでに判断されています。入力はこの画面に残しています。一覧から案件を選び直して、記録済みの判断を確認してください。'
+        ? `${error.message}。入力はこの画面に残しています。一覧から案件を選び直して、最新の状態を確認してください。`
         : `判断を保存できませんでした。入力はこの画面に残っています。${error.message}。接続を確認して再試行してください。`}));
     } finally {
       saving.current = false;

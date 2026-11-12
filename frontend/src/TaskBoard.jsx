@@ -5,6 +5,8 @@ const attention = new Set(['human_decision', 'human_action']);
 
 function DecisionRef({ id, decision, onOpenDecision }) {
   if (!decision) return <span className="task-decision-missing">{id} (見つかりません)</span>;
+  // 取り下げ済みは判断の一覧に無く開けないので、リンクにしない
+  if (decision.withdrawn) return <span className="task-decision-missing"><span className="task-decision-state">取り下げ</span> {decision.title}</span>;
   return <a className="task-decision" href={`/?decision=${encodeURIComponent(id)}`} onClick={event => { event.preventDefault(); onOpenDecision(id); }}>
     <span className="task-decision-state">{decision.answered ? '回答済み' : '未回答'}</span>
     <span>{decision.title}</span>

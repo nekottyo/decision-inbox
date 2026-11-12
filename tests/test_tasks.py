@@ -88,9 +88,9 @@ class TaskTests(unittest.TestCase):
         decision = self.store.add(request_payload(title='方針の判断'))
         self.store.add_task({'id': 't1', 'title': '題', 'decision_id': decision['id']})
         self.store.add_task({'id': 't2', 'title': '判断なし'})
-        self.assertEqual([task['decision'] for task in self.store.tasks()], [{'title': '方針の判断', 'answered': False}, None])
+        self.assertEqual([task['decision'] for task in self.store.tasks()], [{'title': '方針の判断', 'answered': False, 'withdrawn': False}, None])
         self.store.answer(decision['id'], {'choice': 'minimal'})
-        self.assertEqual(self.store.tasks()[0]['decision'], {'title': '方針の判断', 'answered': True})
+        self.assertEqual(self.store.tasks()[0]['decision'], {'title': '方針の判断', 'answered': True, 'withdrawn': False})
 
     def test_入力の検査(self):
         self.assertEqual(self.status(self.store.add_task, {'id': 'a b', 'title': 'x'}), 400)
@@ -155,7 +155,7 @@ class TaskCliTests(unittest.TestCase):
         self.cli('update', '--id', 't1', '--decision', decision['id'])
         self.assertIn(f"判断: 未回答 方針の判断  [{decision['id']}]", self.cli('list').stdout)
         data = json.loads(self.cli('list', '--json').stdout)
-        self.assertEqual(data['lanes'][1]['tasks'][0]['decision'], {'title': '方針の判断', 'answered': False})
+        self.assertEqual(data['lanes'][1]['tasks'][0]['decision'], {'title': '方針の判断', 'answered': False, 'withdrawn': False})
         self.assertEqual(json.loads(self.cli('delete', '--id', 't1').stdout), {'deleted': 't1'})
         failed = self.cli('delete', '--id', 't1')
         self.assertEqual(failed.returncode, 1)
