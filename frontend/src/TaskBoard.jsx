@@ -34,7 +34,8 @@ function TaskList({ lane, changes, onOpenDecision }) {
 }
 
 export default function TaskBoard({ lanes, changes, loading, onOpenDecision }) {
-  if (!lanes.length) return <p className="task-empty">{loading ? 'task を読み込んでいます。' : 'task はありません。'}</p>;
+  if (!lanes.length) return loading ? <p className="task-empty">task を読み込んでいます。</p> : null;
+  if (!lanes.some(lane => lane.tasks.length)) return <p className="task-empty">task はありません。</p>;
   const done = lanes.find(lane => lane.id === 'done');
   return <div id="task-board" className="task-board">
     <div className="task-lanes">

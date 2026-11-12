@@ -35,6 +35,7 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 
 - `GET /api/decisions` → `{"decisions":[依頼全体...],"demo":false}`
 - `GET /api/decisions/{id}` → 依頼全体
+- `GET /api/tasks` → `{"lanes":[...]}` (`task list --json` と同じ形)
 - `POST /api/decisions/{id}/answer`、body `{"choice":"minimal","memo":"任意のメモ"}` → 保存後の依頼全体
 
 依頼全体は登録内容に `id/created_at/answer` を加えたもの。未判断の `answer` は null。判断済みは `{"choice":"minimal","memo":"...","decided_at":"UTC ISO 8601","status":"pending","reason":"","next_step":"","reported_at":null,"can_undo":true}`。status は `pending/processing/completed/blocked/failed`。`reason/next_step` は consumer の停止理由と次の操作で、依頼側の `reason` とは別。`reported_at` は停止報告の時刻で、停止していなければ null。二重判断は `409`、入力は上書きしない。

@@ -260,7 +260,7 @@ class TmuxClientTests(unittest.TestCase):
         self.assertEqual(self.clients('400 1 herdr --session=x\n'), {'x': '%4'})
 
     def test_孫の_CLI_呼び出しは拾わない(self):
-        table = '100 1 -zsh\n101 100 sh -c run\n102 101 herdr pane list\n200 1 herdr pane list\n'
+        table = '100 1 -zsh\n101 100 sh -c run\n102 101 herdr pane list\n103 101 herdr --session x\n200 1 herdr pane list\n'
         self.assertEqual(self.clients(table), {})
 
     def test_tmux_が使えなければ_None(self):
@@ -292,6 +292,28 @@ class TaskTuiTests(unittest.TestCase):
             for key, expected in [('j', 't1'), ('j', 't3'), ('j', 't3'), ('k', 't1'), ('k', 't2'), ('k', 't2')]:
                 handle_key(desk, key)
                 self.assertEqual(desk.task_id, expected)
+
+    def test_未知の_lane_の行があっても上下で_IndexError_にならない(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory)
+            desk.tasks.append({'id': 'x', 'title': '不明', 'lane': 'unknown', 'pane': 'w9:p9'})
+            for key in ['j', 'j', 'j', 'j', 'k', 'k', 'k', 'k', 'k']:
+                handle_key(desk, key)
+            self.assertEqual(desk.task_id, 't2')
+
+    def test_選択を動かすと前の_message_が消える(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory)
+            desk.task_message = '前の結果'
+            handle_key(desk, 'j')
+            self.assertEqual(desk.task_message, '')
+
+    def test_popup_でも_tmux_注記付きの成功なら閉じずに_message_を残す(self):
+        note = '。tmux が無いため端末は切り替えていません'
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory, popup=True, results=((True, 'w9:p2 (workers) を focus しました' + note),))
+            self.assertTrue(handle_key(desk, '\n'))
+            self.assertTrue(desk.task_message.endswith(note))
 
     def test_Enter_で選択中_task_の_pane_へ移り_message_が出て_tasks_のまま(self):
         with tempfile.TemporaryDirectory() as directory:

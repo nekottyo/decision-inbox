@@ -237,7 +237,7 @@ def focus_pane(pane, sessions=herdr_sessions, call=herdr_call, clients=None, run
     if not same:
         mapping = clients() if clients else tmux_clients(run)
         if mapping is None:
-            note = '。tmux が無いため端末は切り替えていません'
+            note = NO_TMUX_NOTE
         elif session not in mapping:
             return False, f'{session} session を開いている端末が無いため移れません'
         else:
@@ -257,6 +257,10 @@ def focus_pane(pane, sessions=herdr_sessions, call=herdr_call, clients=None, run
     if note:
         return True, f'{pane} ({session}) を focus しました{note}'
     return True, f'{pane} ({session}) へ移りました'
+
+
+# 端末を切り替えられなかった成功の注記。popup を閉じると読めないので go_task が見分ける
+NO_TMUX_NOTE = '。tmux が無いため端末は切り替えていません'
 
 
 class Desk:
@@ -320,7 +324,8 @@ class Desk:
         self.task_id = ids[self.task_index] if ids else None
 
     def move_task(self, direction):
-        count = len(self.tasks)
+        self.task_message = ''
+        count = len(self.ordered_tasks())
         self.task_index = max(0, min(self.task_index + direction, count - 1))
         self.task_id = self.ordered_tasks()[self.task_index]['id'] if count else None
 
@@ -333,7 +338,7 @@ class Desk:
             self.task_message = '未保存の入力があるため移れません。判断の画面で保存するか破棄してください'
             return False
         ok, self.task_message = self.focus(tasks[self.task_index]['pane'])
-        return ok and self.popup
+        return ok and self.popup and not self.task_message.endswith(NO_TMUX_NOTE)
 
     def select(self, item):
         self.item, self.scroll = item, 0
