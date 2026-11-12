@@ -14,7 +14,7 @@ import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import webbrowser
 
-from app import LANES, decision_text
+from app import LANES, AppError, decision_text, files_root as default_files_root
 
 PRIORITIES = {'urgent': 'すぐ判断', 'normal': '通常', 'later': 'あとでよい'}
 STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了', 'blocked': '承認・条件待ち', 'failed': '失敗'}
@@ -127,6 +127,12 @@ def edit_with_editor(memo):
         return updated
     finally:
         Path(filename).unlink(missing_ok=True)
+
+
+def view_with_pager(content):
+    # 本文は外部入力なので、端末の制御文字を safe_text で無害にしてから渡す
+    command = shlex.split(os.environ.get('PAGER') or 'less') or ['less']
+    subprocess.run(command, input=safe_text(content), text=True, check=False)
 
 
 HERDR_DIR = Path.home() / '.config' / 'herdr'
@@ -265,8 +271,9 @@ NO_TMUX_NOTE = '。tmux が無いため端末は切り替えていません'
 
 
 class Desk:
-    def __init__(self, store, web_url=None, focus=focus_pane, popup=False):
+    def __init__(self, store, web_url=None, focus=focus_pane, popup=False, files_root=None):
         self.store, self.web_url = store, web_url
+        self.files_root = files_root or default_files_root()
         self.focus, self.popup = focus, popup
         self.items, self.item, self.drafts = [], None, {}
         self.view, self.priority, self.scroll = 'pending', 'all', 0
@@ -475,7 +482,18 @@ class Desk:
     def links(self):
         if not self.item:
             return []
-        return [(link['label'], link['url']) for link in self.item.get('links', []) if http_url(link['url'])]
+        # files は index を target にし、開くときに serve と同じ Store.file で読む
+        return [(link['label'], link['url']) for link in self.item.get('links', []) if http_url(link['url'])] + \
+            [(f"ファイル: {entry['label']}", index) for index, entry in enumerate(self.item.get('files', []))]
+
+    def view_file(self, index, page):
+        try:
+            page(self.store.file(self.item['id'], index, self.files_root)['content'])
+            self.notice = ''
+        except AppError as error:
+            self.notice = f'ファイルを表示できません: {error}'
+        except Exception as error:
+            self.notice = f'pager を起動できません: {error}'
 
     def open_web(self):
         target = decision_url(self.web_url, self.item['id']) if self.item else None
@@ -544,9 +562,12 @@ def detail_lines(desk, columns):
         append('画像は w で対象案件の Web 画面から確認できます')
     if desk.links():
         append()
-        append('関連する PR・issue (o で開く)', curses.A_BOLD)
-        for label, target in desk.links():
-            append(f'{label}: {target}')
+        append('関連リンク・ファイル (o で開く)', curses.A_BOLD)
+        for link in item.get('links', []):
+            if http_url(link['url']):
+                append(f"{link['label']}: {link['url']}")
+        for entry in item.get('files', []):
+            append(f"ファイル: {entry['label']}: {entry['path']}")
     append()
     heading('依頼元の推奨', 'recommendation')
     append(item['recommendation'])
@@ -686,14 +707,14 @@ def draw(screen, desk):
             put(rows - 2, 2, desk.task_message, curses.A_BOLD)
             put(rows - 1, 2, '↑↓ 選択 / Enter 担当 pane へ移る / b で戻る')
         elif desk.mode == 'links':
-            put(1, 2, '関連リンクを開く', curses.A_BOLD)
+            put(1, 2, '関連リンク・ファイルを開く', curses.A_BOLD)
             visible = max(1, (rows - 5) // 2)
             first = max(0, desk.menu_index - visible + 1)
             for offset, (label, target) in enumerate(desk.links()[first:first + visible]):
                 put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
             put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で閉じる')
         else:
-            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'b: task (依頼の進み具合) を表示。↑↓ で選択、Enter で担当 pane へ移る', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
+            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く、ファイルを $PAGER (既定 less) で読む', 'b: task (依頼の進み具合) を表示。↑↓ で選択、Enter で担当 pane へ移る', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
             for index, line in enumerate(help_lines):
                 put(index + 1, 2, line, curses.A_BOLD if index == 0 else 0)
     screen.noutrefresh()
@@ -701,7 +722,7 @@ def draw(screen, desk):
     return body_height
 
 
-def handle_key(desk, key, page_height=10, edit=edit_with_editor):
+def handle_key(desk, key, page_height=10, edit=edit_with_editor, page=view_with_pager):
     if key == '\x1b':
         return False
     if desk.mode:
@@ -726,9 +747,12 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
         elif key in ('\n', '\r', curses.KEY_ENTER):
             if desk.mode == 'quit' and desk.menu_index == 1:
                 return False
-            if desk.mode == 'links':
-                desk.open_url(desk.links()[desk.menu_index][1])
+            target = desk.links()[desk.menu_index][1] if desk.mode == 'links' else None
             desk.mode = None
+            if isinstance(target, int):
+                desk.view_file(target, page)
+            elif target is not None:
+                desk.open_url(target)
         return True
     if key == 'q':
         if desk.dirty():
@@ -772,7 +796,7 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
         if desk.links():
             desk.mode, desk.menu_index = 'links', 0
         else:
-            desk.notice = '関連リンクはありません'
+            desk.notice = '関連リンク・ファイルはありません'
     elif key == '?':
         desk.mode = 'help'
     elif key == 'b':
@@ -790,7 +814,7 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
     return True
 
 
-def run(store, *, web_url=None):
+def run(store, *, web_url=None, files_root=None):
     locale.setlocale(locale.LC_ALL, '')
 
     def interactive(screen):
@@ -801,15 +825,15 @@ def run(store, *, web_url=None):
             pass
         screen.keypad(True)
         screen.timeout(1000)
-        desk = Desk(store, web_url, popup=bool(os.environ.get('HERDR_PLUGIN_ENTRYPOINT_ID')))
+        desk = Desk(store, web_url, popup=bool(os.environ.get('HERDR_PLUGIN_ENTRYPOINT_ID')), files_root=files_root)
         desk.heading_styles = heading_styles()
         next_refresh = time.monotonic() + 1
 
-        def edit(memo):
+        def outside(function, value):
             curses.def_prog_mode()
             curses.endwin()
             try:
-                return edit_with_editor(memo)
+                return function(value)
             finally:
                 curses.reset_prog_mode()
                 screen.keypad(True)
@@ -831,7 +855,7 @@ def run(store, *, web_url=None):
                 continue
             except KeyboardInterrupt:
                 key = 'q'
-            if not handle_key(desk, key, page_height, edit):
+            if not handle_key(desk, key, page_height, lambda memo: outside(edit_with_editor, memo), lambda content: outside(view_with_pager, content)):
                 return 0
 
     return curses.wrapper(interactive)

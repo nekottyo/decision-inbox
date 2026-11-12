@@ -27,16 +27,26 @@ Python 3 の標準ライブラリのみを使用。すべての API は JSON、�
 }
 ```
 
-必須は `title/source/reason/options/recommended/recommendation`。`priority` の既定は `normal`、`background/urgency_reason` は空文字、`links` は空配列、`deadline/image` は null。候補は 2〜8 件で重複しない ID。priority は `urgent/normal/later`。deadline は timezone 付き ISO 8601。リンクは http(s) URL、kind は `pr/issue/other`、label 必須。image は `{"url":"https://example.com/diagram.png","alt":"図の説明"}` または許可済み `/assets/` 内の静的画像参照。任意 HTML は受け付けない。body 上限は 128 KiB。title/source は 200 文字、reason/recommendation は 4000 文字、background は 12000 文字、urgency_reason は 2000 文字、memo は 2000 文字、リンクは 20 件まで。未知の項目・重複 JSON キーは拒否。
+必須は `title/source/reason/options/recommended/recommendation`。`priority` の既定は `normal`、`background/urgency_reason` は空文字、`links` と `files` (後述) は空配列、`deadline/image` は null。候補は 2〜8 件で重複しない ID。priority は `urgent/normal/later`。deadline は timezone 付き ISO 8601。リンクは http(s) URL、kind は `pr/issue/other`、label 必須。image は `{"url":"https://example.com/diagram.png","alt":"図の説明"}` または許可済み `/assets/` 内の静的画像参照。任意 HTML は受け付けない。body 上限は 128 KiB。title/source は 200 文字、reason/recommendation は 4000 文字、background は 12000 文字、urgency_reason は 2000 文字、memo は 2000 文字、リンクは 20 件まで。未知の項目・重複 JSON キーは拒否。
 
 任意の `request_key` は 1〜200 文字の英数字と `_ . : / -` で指定。同じキーかつ既定値補完後の同一 JSON 内容なら同じ ID を返す。同じキーで内容が異なれば `409`。JSON オブジェクトのキー順は問わず、候補やリンクの配列順は内容の一部として扱う。キーなしは従来どおり毎回登録する。update 済みの判断には、現在の内容に加えて update 前のどの内容で再送しても同じ ID を返す。取り下げ済みの判断と同じキーで add すると `409` (置き換えるときは新しい request_key で add する)。
+
+## 判断に付けるファイル
+
+任意の `files` に `[{"path":"/絶対パス/reply.draft.md","label":"返信の下書き"}]` を 20 件まで指定できる。path は `..` 要素を含まない絶対パス (4096 文字まで)、label は 1〜200 文字。登録時は形式だけを検査し、存在や中身は見ない (下書きを消した後の update や再送を通すため)。空配列と省略は同じ内容として扱い、保存する payload には入れない。依頼全体の `files` は常に配列で返す。update の `changes` にも指定できる。
+
+- `GET /api/decisions/{id}/files/{index}` → `{"path":"...","label":"...","content":"本文"}`
+
+表示のたびにファイルを読むので、登録後に直した内容が見える。任意のパスは受けず、登録済みの `files[index]` だけを読む。読めるのは server の `--files-root` (既定は環境変数 `CUE_FILES_ROOT`、無ければ `~/.agents/state/runs`) の下だけで、path と root をそれぞれ realpath で解いてから比べるため、symlink や `..` で root の外へ出るものは `403`。ほかに存在しない・index 範囲外は `404`、ディレクトリや FIFO など通常ファイル以外は `400`、256 KiB 超は `413`、UTF-8 として読めないか NUL を含むものは `415`。エラー body の `error` に理由が入る。Web は `content` を等幅のテキストとしてそのまま表示し、HTML として描画しない。TUI は同じ読み取り処理 (`Store.file`) で本文を取り、制御文字を無害化して `$PAGER` (既定 less) に渡す。`tui --files-root` も同じ既定値を使う。
+
+旧 release は `files` を未知の項目として `400` で拒否する。`files` を付けて登録する側は、この版へ入れ替えてから使う。
 
 ## 未回答の判断の更新と取り下げ
 
 - `POST /api/decisions/{id}/update`、body `{"note":"更新の理由","changes":{"deadline":"2026-12-01T00:00:00+09:00"}}` → 更新後の依頼全体
 - `POST /api/decisions/{id}/withdraw`、body `{"note":"取り下げの理由"}` → 取り下げ後の依頼全体
 
-理由は依頼側の `reason` や report の `reason` と分けるため `note` (1〜2000 文字) と呼ぶ。`changes` は登録時の項目 (title/source/reason/background/priority/urgency_reason/deadline/options/recommended/recommendation/links/image) の部分集合で、現在の内容に重ねてから登録時と同じ検査をする。`request_key` は変更できず `400`。重ねた結果が現在と同じなら revision を上げずに現在の依頼全体を返す。回答済み・取り下げ済みの判断の update は `409`。変更前の内容は DB の `decision_changes` に残る。
+理由は依頼側の `reason` や report の `reason` と分けるため `note` (1〜2000 文字) と呼ぶ。`changes` は登録時の項目 (title/source/reason/background/priority/urgency_reason/deadline/options/recommended/recommendation/links/files/image) の部分集合で、現在の内容に重ねてから登録時と同じ検査をする。`request_key` は変更できず `400`。重ねた結果が現在と同じなら revision を上げずに現在の依頼全体を返す。回答済み・取り下げ済みの判断の update は `409`。変更前の内容は DB の `decision_changes` に残る。
 
 withdraw は未回答の判断だけを対象にし、DB から行は消さない。取り下げ済みへの再送は同じ結果を `200` で返す。回答済み (claim 中・処理中・完了・停止を含む) は `409`。claim は回答済みしか拾わないため、未回答の取り下げと処理中の worker は重ならない。claim 中の判断を止めたいときは、token を持つ worker が report または complete で閉じる。
 
@@ -72,13 +82,13 @@ lease_seconds は省略時 300、1〜3600 秒。front-desk は 3600 秒を指定
 ## CLI
 
 ```sh
-python3 app.py --db /tmp/decision-test.sqlite3 serve --port 4317
+python3 app.py --db /tmp/decision-test.sqlite3 serve --port 4317 [--files-root DIR]
 python3 app.py --db /tmp/decision-test.sqlite3 add --file request.json
 python3 app.py --db /tmp/decision-test.sqlite3 list [--include-withdrawn]
 python3 app.py --db /tmp/decision-test.sqlite3 update --id ID --note "更新の理由" --file changes.json
 python3 app.py --db /tmp/decision-test.sqlite3 withdraw --id ID --note "取り下げの理由"
 python3 app.py --db /tmp/decision-test.sqlite3 watch --interval 2 --timeout 1740
-python3 app.py --db /tmp/decision-test.sqlite3 tui --web-url http://127.0.0.1:4317/
+python3 app.py --db /tmp/decision-test.sqlite3 tui --web-url http://127.0.0.1:4317/ [--files-root DIR]
 python3 app.py --db /tmp/decision-test.sqlite3 claim --worker front-desk --lease-seconds 300
 python3 app.py --db /tmp/decision-test.sqlite3 complete --id ID --token TOKEN
 python3 app.py --db /tmp/decision-test.sqlite3 undo --id ID --decided-at ANSWER_TIMESTAMP

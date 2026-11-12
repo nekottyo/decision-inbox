@@ -34,7 +34,7 @@ class TUICommandTests(unittest.TestCase):
 
     def test_tui_receives_shared_store_without_loading_herdr(self):
         calls = []
-        module = types.SimpleNamespace(run=lambda store, web_url=None: calls.append((store.path, store.list(), web_url)) or 0)
+        module = types.SimpleNamespace(run=lambda store, web_url=None, files_root=None: calls.append((store.path, store.list(), web_url)) or 0)
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / 'tui.sqlite3'
             with patch.dict(sys.modules, {'cue_tui': module}), patch('sys.stdin.isatty', return_value=True), patch('sys.stdout.isatty', return_value=True):
