@@ -1,3 +1,4 @@
+import curses
 import json
 import sqlite3
 from pathlib import Path
@@ -9,7 +10,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import AppError, Store
 from unittest.mock import patch
-from cue_tui import Desk, draw, handle_key
+from cue_tui import Desk, draw, focus_pane, handle_key, tmux_clients
 from test_app import request_payload
 from test_tui import Screen
 
@@ -161,7 +162,201 @@ class TaskCliTests(unittest.TestCase):
         self.assertIn('error', json.loads(failed.stderr))
 
 
+SOCKET_A = Path.home() / '.config' / 'herdr' / 'herdr.sock'
+SOCKET_B = Path.home() / '.config' / 'herdr' / 'sessions' / 'workers' / 'herdr.sock'
+
+
+class FocusPaneTests(unittest.TestCase):
+    def setUp(self):
+        self.calls, self.runs = [], []
+
+    def herdr(self, owners, broken=()):
+        # owners: socket -> pane を持つか。broken の socket は接続できない
+        def call(path, method, params):
+            self.calls.append((path, method, params['pane_id']))
+            if path in broken:
+                raise ConnectionRefusedError()
+            if method == 'pane.focus' and self.focus_error:
+                return {'error': {'code': 'x', 'message': '失敗した'}}
+            if owners.get(path):
+                return {'result': {}}
+            return {'error': {'code': 'pane_not_found', 'message': 'なし'}}
+        return call
+
+    focus_error = False
+
+    def go(self, owners, clients=lambda: {'default': '%1', 'workers': '%7'}, own=SOCKET_A, broken=(), pane='w9:p1', sessions=None):
+        sessions = sessions or (lambda: [('default', SOCKET_A), ('workers', SOCKET_B)])
+        return focus_pane(pane, sessions, self.herdr(owners, broken), clients, self.runs.append, str(own))
+
+    def test_pane_が空なら移らない(self):
+        self.assertEqual(self.go({}, pane='  '), (False, 'この task には担当 pane がありません'))
+        self.assertEqual(self.calls, [])
+
+    def test_どこにも無い(self):
+        self.assertEqual(self.go({}), (False, '担当 pane w9:p1 は herdr にもうありません'))
+
+    def test_2_session_にあると移らない(self):
+        ok, message = self.go({SOCKET_A: True, SOCKET_B: True})
+        self.assertFalse(ok)
+        self.assertIn('複数の session (default, workers)', message)
+        self.assertNotIn('pane.focus', [call[1] for call in self.calls])
+
+    def test_全_socket_に接続できない(self):
+        self.assertEqual(self.go({}, broken=(SOCKET_A, SOCKET_B)), (False, 'herdr に接続できないため移れません'))
+        self.assertEqual(self.go({}, sessions=lambda: []), (False, 'herdr に接続できないため移れません'))
+
+    def test_接続できない_socket_は飛ばす(self):
+        self.assertEqual(self.go({SOCKET_A: True}, broken=(SOCKET_B,)), (True, 'w9:p1 (default) へ移りました'))
+
+    def test_同じ_session_なら_tmux_を触らない(self):
+        def no_clients():
+            raise AssertionError('tmux を呼んではいけない')
+        self.assertEqual(self.go({SOCKET_A: True}, clients=no_clients), (True, 'w9:p1 (default) へ移りました'))
+        self.assertEqual(self.runs, [])
+
+    def test_別_session_は_focus_と_tmux_の_window_切り替えをする(self):
+        self.assertEqual(self.go({SOCKET_B: True}), (True, 'w9:p1 (workers) へ移りました'))
+        self.assertIn((SOCKET_B, 'pane.focus', 'w9:p1'), self.calls)
+        self.assertEqual(self.runs, [['tmux', 'select-window', '-t', '%7'], ['tmux', 'select-pane', '-t', '%7']])
+
+    def test_別_session_の_client_が無ければ_focus_しない(self):
+        result = self.go({SOCKET_B: True}, clients=lambda: {'default': '%1'})
+        self.assertEqual(result, (False, 'workers session を開いている端末が無いため移れません'))
+        self.assertNotIn('pane.focus', [call[1] for call in self.calls])
+
+    def test_tmux_が使えなければ_focus_だけ行う(self):
+        ok, message = self.go({SOCKET_B: True}, clients=lambda: None)
+        self.assertTrue(ok)
+        self.assertEqual(message, 'w9:p1 (workers) を focus しました。tmux が無いため端末は切り替えていません')
+        self.assertIn((SOCKET_B, 'pane.focus', 'w9:p1'), self.calls)
+        self.assertEqual(self.runs, [])
+
+    def test_pane_focus_の_error(self):
+        self.focus_error = True
+        self.assertEqual(self.go({SOCKET_A: True}), (False, 'w9:p1 へ移れませんでした: 失敗した'))
+        self.assertEqual(self.runs, [])
+
+    def test_tmux_の_select_が失敗したら報告する(self):
+        def failing(argv):
+            raise subprocess.CalledProcessError(1, argv)
+        result = focus_pane('w9:p1', lambda: [('workers', SOCKET_B)], self.herdr({SOCKET_B: True}), lambda: {'workers': '%7'}, failing, str(SOCKET_A))
+        self.assertEqual(result, (False, 'herdr の focus は移しましたが、端末の window を切り替えられませんでした'))
+
+
+class TmuxClientTests(unittest.TestCase):
+    PANES = '%1\t100\n%2\t200\n%3\t300\n%4\t400\n'
+
+    def clients(self, table):
+        def run(argv):
+            return self.PANES if argv[:2] == ['tmux', 'list-panes'] else table
+        return tmux_clients(run)
+
+    def test_引数から_session_を読む(self):
+        table = '100 1 -zsh\n101 100 herdr\n200 1 herdr --session workers\n300 1 /usr/bin/herdr session attach review\n'
+        self.assertEqual(self.clients(table), {'default': '%1', 'workers': '%2', 'review': '%3'})
+
+    def test_pane_pid_自身が_client_でも拾う(self):
+        self.assertEqual(self.clients('400 1 herdr --session=x\n'), {'x': '%4'})
+
+    def test_孫の_CLI_呼び出しは拾わない(self):
+        table = '100 1 -zsh\n101 100 sh -c run\n102 101 herdr pane list\n200 1 herdr pane list\n'
+        self.assertEqual(self.clients(table), {})
+
+    def test_tmux_が使えなければ_None(self):
+        def run(argv):
+            raise FileNotFoundError('tmux')
+        self.assertIsNone(tmux_clients(run))
+
+
 class TaskTuiTests(unittest.TestCase):
+    def make(self, directory, popup=False, results=((True, '移りました'),)):
+        store = Store(Path(directory) / 'tui.sqlite3')
+        store.add_task({'id': 't1', 'title': '一つ目', 'lane': 'worker', 'pane': 'w9:p1'})
+        store.add_task({'id': 't2', 'title': '二つ目', 'lane': 'todo', 'pane': 'w9:p2'})
+        store.add_task({'id': 't3', 'title': '三つ目', 'lane': 'worker', 'pane': 'w9:p3'})
+        self.focused = []
+
+        def focus(pane):
+            self.focused.append(pane)
+            return results[0]
+        desk = Desk(store, focus=focus, popup=popup)
+        handle_key(desk, 'b')
+        return store, desk
+
+    def test_上下で選択が表示順に動き端で止まる(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory)
+            # 表示順は todo の t2、worker の t1 t3
+            self.assertEqual(desk.task_id, 't2')
+            for key, expected in [('j', 't1'), ('j', 't3'), ('j', 't3'), ('k', 't1'), ('k', 't2'), ('k', 't2')]:
+                handle_key(desk, key)
+                self.assertEqual(desk.task_id, expected)
+
+    def test_Enter_で選択中_task_の_pane_へ移り_message_が出て_tasks_のまま(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory)
+            handle_key(desk, 'j')
+            self.assertTrue(handle_key(desk, '\n'))
+            self.assertEqual(self.focused, ['w9:p1'])
+            self.assertEqual((desk.mode, desk.task_id), ('tasks', 't1'))
+            screen = Screen(24, 100)
+            with patch('cue_tui.curses.doupdate'):
+                draw(screen, desk)
+            self.assertIn('移りました', '\n'.join(screen.output))
+
+    def test_失敗しても残り選択は変わらない(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory, popup=True, results=((False, '移れません'),))
+            self.assertTrue(handle_key(desk, '\n'))
+            self.assertEqual((desk.mode, desk.task_id, desk.task_message), ('tasks', 't2', '移れません'))
+
+    def test_popup_で成功すると終了する(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, desk = self.make(directory, popup=True)
+            self.assertFalse(handle_key(desk, '\n'))
+            self.assertEqual(self.focused, ['w9:p2'])
+
+    def test_popup_で未保存入力があると_focus_を呼ばない(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, desk = self.make(directory, popup=True)
+            decision = store.add(request_payload())
+            desk.refresh()
+            desk.drafts[decision['id']] = {'choice': None, 'memo': '書きかけ'}
+            self.assertTrue(handle_key(desk, '\n'))
+            self.assertEqual(self.focused, [])
+            self.assertIn('未保存の入力があるため移れません', desk.task_message)
+
+    def test_再読み込みで選択は同じ_task_を保ち消えたら丸める(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, desk = self.make(directory)
+            handle_key(desk, 'j')
+            handle_key(desk, 'j')
+            self.assertEqual(desk.task_id, 't3')
+            store.add_task({'id': 't0', 'title': '先頭', 'lane': 'todo', 'pane': 'w9:p0'})
+            desk.refresh()
+            self.assertEqual((desk.task_id, desk.task_index), ('t3', 3))
+            store.delete_task('t3')
+            desk.refresh()
+            self.assertEqual((desk.task_id, desk.task_index), ('t1', 2))
+
+    def test_選択中の題名行を反転しスクロールが追従する(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, desk = self.make(directory)
+            for number in range(20):
+                store.add_task({'id': f'x{number}', 'title': f'件{number}', 'lane': 'done'})
+            desk.refresh()
+            for _ in range(22):
+                handle_key(desk, 'j')
+            attributes = {}
+            screen = Screen(12, 100)
+            screen.addstr = lambda row, column, value, attribute: attributes.__setitem__(value, attribute)
+            with patch('cue_tui.curses.doupdate'):
+                draw(screen, desk)
+            self.assertGreater(desk.task_scroll, 0)
+            self.assertEqual(attributes['  件19'], curses.A_REVERSE)
+
+
     def test_b_で_task_一覧を開閉できる(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / 'tui.sqlite3')
