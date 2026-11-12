@@ -186,6 +186,17 @@ class HTTPTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_http_tasks_は_lane_別に判断の要約付きで返し書き込みは受けない(self):
+        _, decision, _ = self.request('POST', '/api/decisions', request_payload(title='方針の判断'))
+        Store(self.db).add_task({'id': 't1', 'title': '依頼', 'lane': 'human_decision', 'decision_id': decision['id']})
+        status, data, _ = self.request('GET', '/api/tasks')
+        self.assertEqual(status, 200)
+        self.assertEqual([lane['id'] for lane in data['lanes']], ['todo', 'human_decision', 'worker', 'human_action', 'done'])
+        self.assertEqual(data['lanes'][1]['tasks'][0]['decision'], {'title': '方針の判断', 'answered': False})
+        for method, path in (('POST', '/api/tasks'), ('POST', '/api/tasks/t1')):
+            self.assertEqual(self.request(method, path, {'lane': 'done'})[0], 404)
+        self.assertEqual(Store(self.db).tasks()[0]['lane'], 'human_decision')
+
     def test_http_claim_key_prefix_filters_and_rejects_null(self):
         for key in ('run-a/1', 'run-b/1'):
             _, item, _ = self.request('POST', '/api/decisions', request_payload(request_key=key))

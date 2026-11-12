@@ -417,7 +417,12 @@ class Store:
         if lane is not None and lane not in LANES:
             raise AppError(400, 'lane は ' + ' / '.join(LANES) + ' のいずれかを指定してください')
         with self.db() as connection:
-            rows = [dict(row) for row in connection.execute('SELECT * FROM tasks ORDER BY created_at,id')]
+            rows = [dict(row) for row in connection.execute('''SELECT tasks.*, decisions.payload AS decision_payload, decisions.choice AS decision_choice
+                FROM tasks LEFT JOIN decisions ON decisions.id=tasks.decision_id ORDER BY tasks.created_at,tasks.id''')]
+        # web / CLI / TUI が同じ形で判断の題名と回答の有無を出せるよう、ここで 1 度だけ引く
+        for row in rows:
+            payload, choice = row.pop('decision_payload'), row.pop('decision_choice')
+            row['decision'] = {'title': json.loads(payload)['title'], 'answered': choice is not None} if payload else None
         order = list(LANES)
         rows = [row for row in rows if lane is None or row['lane'] == lane]
         return sorted(rows, key=lambda row: order.index(row['lane']) if row['lane'] in order else len(order))
@@ -569,6 +574,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == 'GET':
                 if path == '/api/decisions':
                     return self.json_response(200, {'decisions': store.list(), 'demo': self.server.demo})
+                if path == '/api/tasks':
+                    # 書き込みは CLI に一本化しているので、HTTP は一覧の GET だけを出す
+                    return self.json_response(200, task_lanes(store))
                 match = re.fullmatch(r'/api/decisions/([a-f0-9]{32})', path)
                 if match:
                     return self.json_response(200, store.get(match[1]))
@@ -681,6 +689,15 @@ def watch_ready(store, interval, timeout, key_prefix=None):
     return 0
 
 
+def decision_text(task):
+    if not task['decision_id']:
+        return ''
+    decision = task['decision']
+    if decision is None:
+        return f"{task['decision_id']} (見つかりません)"
+    return f"{'回答済み' if decision['answered'] else '未回答'} {decision['title']}  [{task['decision_id']}]"
+
+
 def format_tasks(store, lane=None):
     lines = []
     tasks = store.tasks(lane)
@@ -691,7 +708,7 @@ def format_tasks(store, lane=None):
             for task in group:
                 lines.append(f"- {task['title']}  [{task['id']}]")
                 updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
-                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('残り', task['remaining']), ('判断', task['decision_id'] or ''), ('更新', updated)]
+                parts = [('依頼', task['request']), ('担当', f"{task['pane']} {task['run']}".strip()), ('結果', task['result']), ('残り', task['remaining']), ('判断', decision_text(task)), ('更新', updated)]
                 lines.append('  ' + ' / '.join(f'{name}: {value}' for name, value in parts if value))
     return '\n'.join(lines)
 
@@ -707,10 +724,12 @@ def run_task(store, args):
         return store.update_task(args.id, {key: value for key, value in payload.items() if value is not None})
     if args.task_command == 'delete':
         return store.delete_task(args.id)
-    tasks = store.tasks(args.lane)
-    if args.json:
-        return {'lanes': [{'id': key, 'label': label, 'tasks': [task for task in tasks if task['lane'] == key]} for key, label in LANES.items() if args.lane in (None, key)]}
-    return None
+    return task_lanes(store, args.lane) if args.json else None
+
+
+def task_lanes(store, lane=None):
+    tasks = store.tasks(lane)
+    return {'lanes': [{'id': key, 'label': label, 'tasks': [task for task in tasks if task['lane'] == key]} for key, label in LANES.items() if lane in (None, key)]}
 
 
 def main(argv=None):

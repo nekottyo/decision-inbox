@@ -1,10 +1,12 @@
 """Cue の端末表示。保存と検証は注入された Store に任せる。"""
 import curses
+import json
 import locale
 import os
 from datetime import datetime
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import tempfile
 import time
@@ -12,7 +14,7 @@ import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import webbrowser
 
-from app import LANES
+from app import LANES, decision_text
 
 PRIORITIES = {'urgent': 'すぐ判断', 'normal': '通常', 'later': 'あとでよい'}
 STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了', 'blocked': '承認・条件待ち', 'failed': '失敗'}
@@ -127,15 +129,152 @@ def edit_with_editor(memo):
         Path(filename).unlink(missing_ok=True)
 
 
+HERDR_DIR = Path.home() / '.config' / 'herdr'
+EXTERNAL_TIMEOUT = 2
+
+
+def herdr_sessions():
+    """herdr の session 名と socket の組。default は herdr.sock 直下"""
+    found = [('default', HERDR_DIR / 'herdr.sock')]
+    found += [(path.parent.name, path) for path in sorted((HERDR_DIR / 'sessions').glob('*/herdr.sock'))]
+    return [(name, path) for name, path in found if path.exists()]
+
+
+def herdr_call(socket_path, method, params):
+    """1 行の JSON を送り、1 行の JSON を受ける。接続できなければ OSError"""
+    request = json.dumps({'id': 'cue', 'method': method, 'params': params}) + '\n'
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(EXTERNAL_TIMEOUT)
+        connection.connect(str(socket_path))
+        connection.sendall(request.encode())
+        data = b''
+        while not data.endswith(b'\n'):
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    return json.loads(data)
+
+
+def run_text(argv):
+    return subprocess.run(argv, check=True, capture_output=True, text=True, timeout=EXTERNAL_TIMEOUT).stdout
+
+
+def herdr_session_of(args):
+    """herdr client の引数から session 名を返す。client でなければ None"""
+    try:
+        words = shlex.split(args)
+    except ValueError:
+        words = args.split()
+    if not words or os.path.basename(words[0]) != 'herdr':
+        return None
+    rest, session, index = words[1:], 'default', 0
+    while index < len(rest):
+        if rest[index] == '--session' and index + 1 < len(rest):
+            session, index = rest[index + 1], index + 2
+        elif rest[index].startswith('--session='):
+            session, index = rest[index].split('=', 1)[1], index + 1
+        elif rest[index:index + 2] == ['session', 'attach'] and index + 2 < len(rest):
+            session, index = rest[index + 2], index + 3
+        else:
+            # pane list などの CLI 呼び出しは client ではない
+            return None
+    return session
+
+
+def tmux_clients(run=run_text):
+    """herdr session 名 -> その client が動く tmux の pane_id。tmux が使えなければ None"""
+    try:
+        panes = run(['tmux', 'list-panes', '-a', '-F', '#{pane_id}\t#{pane_pid}'])
+        table = run(['ps', '-A', '-o', 'pid=,ppid=,args='])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commands, children = {}, {}
+    for line in table.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            commands[parts[0]] = parts[2]
+            children.setdefault(parts[1], []).append(parts[0])
+    found = {}
+    for line in panes.splitlines():
+        tmux_pane, _, pid = line.partition('\t')
+        # 子までしか見ない。herdr server は client の子として動くことがあり、子孫には
+        # herdr の pane 内の全 process (別 session の client を含む) が入るため
+        for candidate in [pid, *children.get(pid, [])]:
+            session = herdr_session_of(commands.get(candidate, ''))
+            if session is not None:
+                found.setdefault(session, tmux_pane)
+    return found
+
+
+def focus_pane(pane, sessions=herdr_sessions, call=herdr_call, clients=None, run=run_text, own_socket=None):
+    """担当 pane へ herdr の focus で移る。(成否, 画面に出す 1 行) を返す"""
+    pane = (pane or '').strip()
+    if not pane:
+        return False, 'この task には担当 pane がありません'
+    reached, hits = 0, []
+    for name, path in sessions():
+        try:
+            response = call(path, 'pane.get', {'pane_id': pane})
+        except (OSError, ValueError):
+            continue
+        reached += 1
+        if 'result' in response:
+            hits.append((name, path))
+    if not reached:
+        return False, 'herdr に接続できないため移れません'
+    if not hits:
+        return False, f'担当 pane {pane} は herdr にもうありません'
+    if len(hits) > 1:
+        return False, f"担当 pane {pane} が複数の session ({', '.join(name for name, _ in hits)}) にあるため移れません"
+    session, path = hits[0]
+    if own_socket is None:
+        own_socket = os.environ.get('HERDR_SOCKET_PATH', '')
+    try:
+        same = bool(own_socket) and Path(own_socket).resolve() == Path(path).resolve()
+    except OSError:
+        same = False
+    tmux_pane, note = None, ''
+    if not same:
+        mapping = clients() if clients else tmux_clients(run)
+        if mapping is None:
+            note = NO_TMUX_NOTE
+        elif session not in mapping:
+            return False, f'{session} session を開いている端末が無いため移れません'
+        else:
+            tmux_pane = mapping[session]
+    try:
+        response = call(path, 'pane.focus', {'pane_id': pane})
+    except (OSError, ValueError) as error:
+        return False, f'{pane} へ移れませんでした: {error}'
+    if 'error' in response:
+        return False, f"{pane} へ移れませんでした: {response['error'].get('message', '')}"
+    if tmux_pane:
+        try:
+            run(['tmux', 'select-window', '-t', tmux_pane])
+            run(['tmux', 'select-pane', '-t', tmux_pane])
+        except (OSError, subprocess.SubprocessError):
+            return False, 'herdr の focus は移しましたが、端末の window を切り替えられませんでした'
+    if note:
+        return True, f'{pane} ({session}) を focus しました{note}'
+    return True, f'{pane} ({session}) へ移りました'
+
+
+# 端末を切り替えられなかった成功の注記。popup を閉じると読めないので go_task が見分ける
+NO_TMUX_NOTE = '。tmux が無いため端末は切り替えていません'
+
+
 class Desk:
-    def __init__(self, store, web_url=None):
+    def __init__(self, store, web_url=None, focus=focus_pane, popup=False):
         self.store, self.web_url = store, web_url
+        self.focus, self.popup = focus, popup
         self.items, self.item, self.drafts = [], None, {}
         self.view, self.priority, self.scroll = 'pending', 'all', 0
         self.notice, self.load_error = '', ''
         self.mode, self.menu_index = None, 0
         self.jump_choice = False
         self.tasks, self.task_scroll, self.task_error = [], 0, ''
+        self.task_index, self.task_id, self.task_message = 0, None, ''
         self.heading_styles = {}
         self.refresh()
 
@@ -147,6 +286,7 @@ class Desk:
         # task の失敗で判断の表示を止めない
         try:
             self.tasks, self.task_error = self.store.tasks(), ''
+            self.sync_task()
         except Exception as error:
             self.task_error = f'task を読み込めません: {error}。r で再試行できます'
         try:
@@ -170,6 +310,36 @@ class Desk:
             self.select(self.visible()[0])
         if old_ids and {item['id'] for item in fresh} - old_ids and not self.notice:
             self.notice = '新しい判断が届きました。閲覧中の案件と下書きは保持しています'
+
+    def ordered_tasks(self):
+        # task 画面の表示順 (lane 順、lane 内は一覧順)
+        return [task for key in LANES for task in self.tasks if task['lane'] == key]
+
+    def sync_task(self):
+        # 一覧が変わっても同じ task id を保ち、消えたら範囲内に丸める
+        ids = [task['id'] for task in self.ordered_tasks()]
+        if self.task_id in ids:
+            self.task_index = ids.index(self.task_id)
+        else:
+            self.task_index = max(0, min(self.task_index, len(ids) - 1))
+        self.task_id = ids[self.task_index] if ids else None
+
+    def move_task(self, direction):
+        self.task_message = ''
+        count = len(self.ordered_tasks())
+        self.task_index = max(0, min(self.task_index + direction, count - 1))
+        self.task_id = self.ordered_tasks()[self.task_index]['id'] if count else None
+
+    def go_task(self):
+        """選択中 task の担当 pane へ移る。TUI を終えるべきなら True"""
+        tasks = self.ordered_tasks()
+        if not tasks:
+            return False
+        if self.popup and self.dirty():
+            self.task_message = '未保存の入力があるため移れません。判断の画面で保存するか破棄してください'
+            return False
+        ok, self.task_message = self.focus(tasks[self.task_index]['pane'])
+        return ok and self.popup and not self.task_message.endswith(NO_TMUX_NOTE)
 
     def select(self, item):
         self.item, self.scroll = item, 0
@@ -378,20 +548,33 @@ def detail_lines(desk, columns):
 
 def task_lines(desk, columns):
     counts = {key: sum(task['lane'] == key for task in desk.tasks) for key in LANES}
+    human = ('human_decision', 'human_action')
     # 人が動く lane を先に数える。並びの残りは LANES の順
-    order = sorted(LANES, key=lambda key: key not in ('human_decision', 'human_action'))
-    lines = [' / '.join(f'{LANES[key]} {counts[key]}' for key in order)]
+    order = sorted(LANES, key=lambda key: key not in human)
+    # 色は判断画面に合わせる (人が止めている = 止まった理由の色、回答済み = 推奨の色)。
+    # 色を出せない端末でも記号と文字で区別できるよう、色は補助にとどめる
+    styles = desk.heading_styles
+    waiting = styles.get('stopped', curses.A_BOLD)
+    answered = styles.get('recommendation', 0) & ~curses.A_BOLD
+    lines, selected = [(' / '.join(f'{LANES[key]} {counts[key]}' for key in order), curses.A_BOLD)], None
     for key, label in LANES.items():
-        lines.append(f'■ {label} ({counts[key]})')
+        lines.append((f"{'▲' if key in human else '■'} {label} ({counts[key]})", waiting if key in human and counts[key] else curses.A_BOLD))
         for task in desk.tasks:
             if task['lane'] != key:
                 continue
-            lines.append(f"  {task['title']}")
+            start = len(lines)
+            lines.append((f"{'>' if task['id'] == desk.task_id else ' '} {task['title']}", 0))
             updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
             parts = [f"担当 {task['pane']} {task['run']}".strip() if task['pane'] or task['run'] else '']
-            parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '', f'更新 {updated}']
-            lines.append('    ' + ' / '.join(part for part in parts if part))
-    return lines
+            parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '']
+            parts.append(f'更新 {updated}')
+            lines.append(('    ' + ' / '.join(part for part in parts if part), 0))
+            if task['decision_id']:
+                decision = task['decision']
+                lines.append((f'    判断 {decision_text(task)}', answered if decision and decision['answered'] else waiting))
+            if task['id'] == desk.task_id:
+                selected = (start, len(lines) - 1)
+    return lines, selected
 
 
 def draw(screen, desk):
@@ -460,13 +643,20 @@ def draw(screen, desk):
             put(rows - 2, 2, '↑↓ / ←→で選択、Enter で決定、Esc で閉じる')
         elif desk.mode == 'tasks':
             # 読み込み失敗を 0 件と見分けられるよう、件数の代わりに失敗を出す
-            put(0, 2, desk.task_error or 'task  ' + task_lines(desk, columns)[0], curses.A_BOLD)
-            lines = task_lines(desk, columns)[1:]
+            lines, selected = task_lines(desk, columns)
+            put(0, 2, desk.task_error or 'task  ' + lines[0][0], curses.A_BOLD)
+            lines = lines[1:]
             visible = max(1, rows - 3)
+            if selected is not None:
+                # 題名行から判断の行までがはみ出さないように追従する
+                first, last = selected[0] - 1, selected[1] - 1
+                desk.task_scroll = min(max(desk.task_scroll, last + 1 - visible), first)
+                selected = first
             desk.task_scroll = min(max(0, desk.task_scroll), max(0, len(lines) - visible))
-            for offset, value in enumerate(lines[desk.task_scroll:desk.task_scroll + visible]):
-                put(1 + offset, 2, value)
-            put(rows - 1, 2, '↑↓ スクロール / b で戻る')
+            for offset, (value, attribute) in enumerate(lines[desk.task_scroll:desk.task_scroll + visible]):
+                put(1 + offset, 2, value, curses.A_REVERSE | curses.A_BOLD if desk.task_scroll + offset == selected else attribute)
+            put(rows - 2, 2, desk.task_message, curses.A_BOLD)
+            put(rows - 1, 2, '↑↓ 選択 / Enter 担当 pane へ移る / b で戻る')
         elif desk.mode == 'links':
             put(1, 2, '関連リンクを開く', curses.A_BOLD)
             visible = max(1, (rows - 5) // 2)
@@ -475,7 +665,7 @@ def draw(screen, desk):
                 put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
             put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で閉じる')
         else:
-            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'b: task (依頼の進み具合) を読み取り専用で表示', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
+            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く', 'b: task (依頼の進み具合) を表示。↑↓ で選択、Enter で担当 pane へ移る', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
             for index, line in enumerate(help_lines):
                 put(index + 1, 2, line, curses.A_BOLD if index == 0 else 0)
     screen.noutrefresh()
@@ -488,12 +678,16 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
         return False
     if desk.mode:
         if desk.mode == 'tasks':
-            if key in ('b', '\n', '\r', curses.KEY_ENTER, 'q', '?'):
+            if key in ('b', 'q', '?'):
                 desk.mode = None
             elif key in (curses.KEY_UP, 'k'):
-                desk.task_scroll = max(0, desk.task_scroll - 1)
+                desk.move_task(-1)
             elif key in (curses.KEY_DOWN, 'j'):
-                desk.task_scroll += 1
+                desk.move_task(1)
+            elif key in ('\n', '\r', curses.KEY_ENTER):
+                return not desk.go_task()
+            elif key == 'r':
+                desk.refresh()
         elif desk.mode == 'help':
             if key in ('\n', '\r', curses.KEY_ENTER, '?', 'q'):
                 desk.mode = None
@@ -555,7 +749,7 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor):
         desk.mode = 'help'
     elif key == 'b':
         desk.refresh()
-        desk.mode, desk.task_scroll = 'tasks', 0
+        desk.mode, desk.task_scroll, desk.task_message = 'tasks', 0, ''
     elif key == 'm':
         if desk.item and desk.item['answer'] is None:
             try:
@@ -579,7 +773,7 @@ def run(store, *, web_url=None):
             pass
         screen.keypad(True)
         screen.timeout(1000)
-        desk = Desk(store, web_url)
+        desk = Desk(store, web_url, popup=bool(os.environ.get('HERDR_PLUGIN_ENTRYPOINT_ID')))
         desk.heading_styles = heading_styles()
         next_refresh = time.monotonic() + 1
 

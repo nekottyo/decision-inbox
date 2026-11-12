@@ -128,3 +128,40 @@
   .desk-detail { padding: 22px 16px; }
   .form-actions { flex-direction: column-reverse; align-items: stretch; }
 }
+.desk-screens { display: flex; gap: 4px; margin-right: auto; margin-left: 28px; }
+.desk-screens button { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--desk-muted); font: inherit; font-size: 13px; cursor: pointer; }
+.desk-screens button:hover { background: #22323f; }
+.desk-screens button[aria-current="page"] { border-color: var(--desk-line); background: var(--desk-inset); color: var(--desk-text); }
+.task-lanes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.task-lane, .task-done { min-width: 0; padding: 14px 12px; border: 1px solid var(--desk-line); border-radius: 8px; background: var(--desk-inset); }
+.task-lane.attention { border-color: #c98f6f; box-shadow: inset 0 3px #f1ad94; }
+.task-lane h2, .task-done summary { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 13px; font-weight: 700; }
+.task-lane.attention h2 { color: #ffc0aa; }
+.task-count { min-width: 19px; padding: 0 6px; border-radius: 10px; background: #2b3b47; font-size: 11px; line-height: 1.7; text-align: center; }
+.task-done { margin-top: 12px; }
+.task-done summary { width: fit-content; margin: 0; color: var(--desk-muted); cursor: pointer; }
+.task-done[open] summary { margin-bottom: 10px; }
+.task-done .task-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; }
+.task-done .task-list li + li { margin-top: 0; }
+.task-list { list-style: none; margin: 0; padding: 0; }
+.task-list li + li { margin-top: 8px; }
+.task-card { padding: 10px 12px; border: 1px solid var(--desk-line); border-radius: 6px; background: var(--desk-surface); }
+/* 更新された card に一時的な印を付ける。点滅はさせず、数秒で通常の見た目へ戻す */
+.task-card.changed { animation: task-changed 8s ease-out; }
+@keyframes task-changed { from { border-color: var(--desk-accent); background: #243e35; } to { border-color: var(--desk-line); background: var(--desk-surface); } }
+.task-title { display: block; font-size: 13px; font-weight: 600; line-height: 1.6; overflow-wrap: anywhere; }
+.task-card dl { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 2px 8px; margin: 6px 0 0; font-size: 11px; line-height: 1.6; }
+.task-card dt { color: var(--desk-muted); }
+.task-card dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-card a { text-decoration: underline; text-underline-offset: 3px; }
+.task-decision { display: inline; }
+.task-decision-state { margin-right: 6px; padding: 0 5px; border: 1px solid var(--desk-line); border-radius: 4px; font-size: 10px; }
+.task-decision-missing { color: var(--desk-muted); }
+.task-empty { margin: 0; color: var(--desk-muted); font-size: 12px; }
+@media (max-width: 960px) { .task-lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 720px) {
+  .desk-screens { margin-left: 12px; }
+  .desk-screens button { padding: 5px 8px; font-size: 12px; }
+  .task-lanes { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) { .task-card.changed { animation: none; border-color: var(--desk-accent); } }
