@@ -192,10 +192,26 @@ class HTTPTests(unittest.TestCase):
         status, data, _ = self.request('GET', '/api/tasks')
         self.assertEqual(status, 200)
         self.assertEqual([lane['id'] for lane in data['lanes']], ['todo', 'human_decision', 'worker', 'human_action', 'done'])
-        self.assertEqual(data['lanes'][1]['tasks'][0]['decision'], {'title': '方針の判断', 'answered': False})
+        self.assertEqual(data['lanes'][1]['tasks'][0]['decision'], {'title': '方針の判断', 'answered': False, 'withdrawn': False})
         for method, path in (('POST', '/api/tasks'), ('POST', '/api/tasks/t1')):
             self.assertEqual(self.request(method, path, {'lane': 'done'})[0], 404)
         self.assertEqual(Store(self.db).tasks()[0]['lane'], 'human_decision')
+
+    def test_http_update_と_withdraw(self):
+        _, item, _ = self.request('POST', '/api/decisions', request_payload())
+        path = '/api/decisions/' + item['id']
+        status, updated, _ = self.request('POST', path + '/update', {'note': '理由を補足', 'changes': {'reason': '補足した理由'}})
+        self.assertEqual((status, updated['revision'], updated['reason']), (200, 1, '補足した理由'))
+        status, body, _ = self.request('POST', path + '/answer', {'choice': 'minimal', 'revision': 0})
+        self.assertEqual(status, 409)
+        self.assertIn('更新されています', body['error'])
+        status, withdrawn, _ = self.request('POST', path + '/withdraw', {'note': '不要'})
+        self.assertEqual((status, withdrawn['withdrawn']['note']), (200, '不要'))
+        self.assertEqual(self.request('GET', '/api/decisions')[1]['decisions'], [])
+        self.assertEqual(self.request('GET', path)[1]['withdrawn']['note'], '不要')
+        _, other, _ = self.request('POST', '/api/decisions', request_payload())
+        self.request('POST', f"/api/decisions/{other['id']}/answer", {'choice': 'minimal'})
+        self.assertEqual(self.request('POST', f"/api/decisions/{other['id']}/withdraw", {'note': '不要'})[0], 409)
 
     def test_http_claim_key_prefix_filters_and_rejects_null(self):
         for key in ('run-a/1', 'run-b/1'):

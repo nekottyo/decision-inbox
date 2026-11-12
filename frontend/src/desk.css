@@ -42,7 +42,7 @@
 .case-button:hover { background: #22323f; }
 .case-button:disabled { cursor: wait; }
 .case-button[aria-current="true"] { border-color: #4d7564; background: #243e35; box-shadow: inset 3px 0 var(--desk-accent); }
-.case-topline { display: flex; align-items: center; margin-bottom: 7px; }
+.case-topline { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; }
 .case-title { display: block; font-size: 13px; line-height: 1.7; font-weight: 600; overflow-wrap: anywhere; }
 .case-meta { display: block; margin-top: 7px; color: var(--desk-muted); font-size: 11px; }
 .case-answer { display: block; margin-top: 8px; color: #b5d6c4; font-size: 11px; }
@@ -56,6 +56,9 @@
 .source > span { display: block; margin-top: 3px; }
 .deadline { margin: 12px 0 0; color: var(--desk-muted); font-size: 12px; }
 .deadline.urgent { color: #f1ad94; }
+.case-update { display: block; margin-top: 6px; color: #8ec9ed; font-size: 11px; overflow-wrap: anywhere; }
+.update-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 0; color: #8ec9ed; font-size: 13px; overflow-wrap: anywhere; }
+.update-note time { color: var(--desk-muted); font-size: 12px; }
 .desk-detail h3 { margin: 0 0 7px; font-size: 13px; font-weight: 700; }
 .context, .background-section { margin-bottom: 22px; }
 .reason { margin: 0; font-size: 15px; line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; }

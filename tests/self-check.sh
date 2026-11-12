@@ -161,7 +161,7 @@ assert(r.ok,'別 client から先に確定');
 JS
 ab scrollintoview '#confirm' >/dev/null
 ab click '#confirm' >/dev/null
-ab wait --fn "document.querySelector('#error').textContent.includes('すでに判断') && !document.querySelector('#confirm').disabled && document.querySelector('#confirm').getAttribute('aria-disabled') !== 'true'" >/dev/null
+ab wait --fn "document.querySelector('#error').textContent.includes('別の画面で判断済み') && !document.querySelector('#confirm').disabled && document.querySelector('#confirm').getAttribute('aria-disabled') !== 'true'" >/dev/null
 js <<'JS'
 assert(document.querySelector('#memo').value==='競合時にも保持するメモ' && document.querySelector('input[value="a"]').checked,'409 で入力を保持');
 return '合格：二重判断の競合通知と入力保持';
