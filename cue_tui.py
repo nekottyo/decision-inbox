@@ -12,7 +12,7 @@ import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import webbrowser
 
-from app import LANES
+from app import LANES, decision_text
 
 PRIORITIES = {'urgent': 'すぐ判断', 'normal': '通常', 'later': 'あとでよい'}
 STATUSES = {'pending': '処理待ち', 'processing': '対応中', 'completed': '完了', 'blocked': '承認・条件待ち', 'failed': '失敗'}
@@ -389,7 +389,8 @@ def task_lines(desk, columns):
             lines.append(f"  {task['title']}")
             updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
             parts = [f"担当 {task['pane']} {task['run']}".strip() if task['pane'] or task['run'] else '']
-            parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '', f'更新 {updated}']
+            parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '']
+            parts += [f'判断 {decision_text(task)}' if task['decision_id'] else '', f'更新 {updated}']
             lines.append('    ' + ' / '.join(part for part in parts if part))
     return lines
 

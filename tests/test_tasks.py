@@ -30,7 +30,7 @@ class TaskTests(unittest.TestCase):
 
     def test_追加した_task_は既定で_todo_になり作成と更新が同時刻になる(self):
         task = self.store.add_task({'id': 't1', 'title': '題'})
-        self.assertEqual(self.store.tasks(), [task])
+        self.assertEqual(self.store.tasks(), [{**task, 'decision': None}])
         self.assertEqual(task['lane'], 'todo')
         self.assertEqual(task['created_at'], task['updated_at'])
         self.assertIsNone(task['decision_id'])
@@ -82,6 +82,14 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.status(self.store.update_task, 't1', {'decision_id': 'a' * 32}), 404)
         self.assertEqual(self.status(self.store.update_task, 't1', {'decision_id': 'zz'}), 400)
         self.assertIsNone(self.store.update_task('t1', {'decision_id': ''})['decision_id'])
+
+    def test_一覧は判断の題名と回答の有無を添える(self):
+        decision = self.store.add(request_payload(title='方針の判断'))
+        self.store.add_task({'id': 't1', 'title': '題', 'decision_id': decision['id']})
+        self.store.add_task({'id': 't2', 'title': '判断なし'})
+        self.assertEqual([task['decision'] for task in self.store.tasks()], [{'title': '方針の判断', 'answered': False}, None])
+        self.store.answer(decision['id'], {'choice': 'minimal'})
+        self.assertEqual(self.store.tasks()[0]['decision'], {'title': '方針の判断', 'answered': True})
 
     def test_入力の検査(self):
         self.assertEqual(self.status(self.store.add_task, {'id': 'a b', 'title': 'x'}), 400)
@@ -142,6 +150,11 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(len(only['lanes']), 1)
         invalid = self.cli('list', '--json', '--lane', 'bogus')
         self.assertEqual((invalid.returncode, invalid.stdout), (1, ''))
+        decision = Store(self.db).add(request_payload(title='方針の判断'))
+        self.cli('update', '--id', 't1', '--decision', decision['id'])
+        self.assertIn(f"判断: 未回答 方針の判断  [{decision['id']}]", self.cli('list').stdout)
+        data = json.loads(self.cli('list', '--json').stdout)
+        self.assertEqual(data['lanes'][1]['tasks'][0]['decision'], {'title': '方針の判断', 'answered': False})
         self.assertEqual(json.loads(self.cli('delete', '--id', 't1').stdout), {'deleted': 't1'})
         failed = self.cli('delete', '--id', 't1')
         self.assertEqual(failed.returncode, 1)
@@ -152,7 +165,9 @@ class TaskTuiTests(unittest.TestCase):
     def test_b_で_task_一覧を開閉できる(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / 'tui.sqlite3')
-            store.add_task({'id': 't1', 'title': '実装中の依頼', 'lane': 'worker', 'pane': 'p1'})
+            decision = store.add(request_payload(title='方針の判断'))
+            store.answer(decision['id'], {'choice': 'minimal'})
+            store.add_task({'id': 't1', 'title': '実装中の依頼', 'lane': 'worker', 'pane': 'p1', 'decision_id': decision['id']})
             desk = Desk(store)
             self.assertTrue(handle_key(desk, 'b'))
             self.assertEqual(desk.mode, 'tasks')
@@ -164,6 +179,7 @@ class TaskTuiTests(unittest.TestCase):
             output = '\n'.join(screen.output)
             self.assertIn('worker 作業中 (1)', output)
             self.assertIn('実装中の依頼', output)
+            self.assertIn('判断 回答済み 方針の判断', output)
             self.assertIn('完了 (0)', output)
             handle_key(desk, 'b')
             self.assertIsNone(desk.mode)

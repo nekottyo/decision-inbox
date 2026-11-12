@@ -12,10 +12,10 @@ const priorityOptions = [
   { value: 'all', label: 'すべて' },
   ...Object.entries(priorities).map(([value, label]) => ({ value, label })),
 ];
-const dateText = value => new Intl.DateTimeFormat('ja-JP', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+export const dateText = value => new Intl.DateTimeFormat('ja-JP', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 const answerTitle = item => item.options.find(option => option.id === item.answer?.choice)?.title || '';
 
-function safeUrl(value, image = false) {
+export function safeUrl(value, image = false) {
   if (typeof value !== 'string' || /[\s\\\u0000-\u001f]/.test(value)) return null;
   if (image && /^\/assets\/[a-zA-Z0-9_-]+\.(png|jpg|jpeg|gif|webp|svg)$/.test(value)) return value;
   try {
@@ -63,6 +63,7 @@ function RecordedAnswer({ item, saving, onUndo, onRetry }) {
 export default function DecisionDesk({
   items, counts, selectedItem, view, priority, draft, loading, saving, demo, notice, error,
   detailRef, onViewChange, onPriorityChange, onSelect, onDraftChange, onSubmit, onDefer, onUndo, onRetry,
+  screen, onScreenChange, board, waitingTasks, taskError,
 }) {
   const item = selectedItem;
   const links = item?.links.filter(link => safeUrl(link.url)) || [];
@@ -73,13 +74,21 @@ export default function DecisionDesk({
     <a className="skip-link" href="#detail">案件の詳細へ</a>
     <header className="desk-topbar">
       <h1><a href="/">Cue</a></h1>
+      <nav className="desk-screens" aria-label="画面の切り替え">
+        <button type="button" id="screen-decisions" aria-current={screen === 'decisions' ? 'page' : undefined} disabled={saving} onClick={() => onScreenChange('decisions')}>判断<span className="tab-count">{counts.pending}</span></button>
+        <button type="button" id="screen-tasks" aria-current={screen === 'tasks' ? 'page' : undefined} disabled={saving} onClick={() => onScreenChange('tasks')}>task<span className="tab-count" title="人の判断待ちと人の操作待ちの件数">人待ち {waitingTasks}</span></button>
+      </nav>
       <span id="mode-label"><Badge label={demo ? 'ローカルデモ' : 'ローカル'} variant="neutral" /></span>
     </header>
     <main className="desk-main">
       <p id="mode-notice" className="mode-notice">{demo ? 'デモ専用の一時データです。実際の依頼や処理キューとは分離されています。' : '判断はこの端末に保存されます。回答後の処理は、依頼元が引き受けます。'}</p>
       <div id="notice" className="desk-notice" role="status" aria-live="polite" aria-atomic="true">{notice}</div>
       <div id="error" className="desk-error" role="alert" hidden={!error}>{error}</div>
-      <div className="desk-workspace">
+      {screen === 'tasks' ? <>
+        <div id="task-error" className="desk-error" role="alert" hidden={!taskError}>{taskError}</div>
+        {board}
+        <footer className="desk-footer">task は CLI (task add / move / update) で更新します。この画面は読み取り専用で、5 秒ごとに最新の状態を取り込みます。</footer>
+      </> : <><div className="desk-workspace">
         <aside className="inbox" aria-label="案件一覧">
           <div className="desk-tabs"><TabList aria-label="一覧の切り替え" value={view} onChange={onViewChange} layout="fill">
             <Tab value="pending" data-view="pending" label="判断待ち" endContent={<span id="pending-count" className="tab-count">{counts.pending}</span>} />
@@ -122,7 +131,7 @@ export default function DecisionDesk({
           </>}
         </article>
       </div>
-      <footer className="desk-footer">判断を記録した後は、「判断済み」で後続処理を確認できます。</footer>
+      <footer className="desk-footer">判断を記録した後は、「判断済み」で後続処理を確認できます。</footer></>}
     </main>
   </div>;
 }

@@ -1,5 +1,6 @@
 import {useEffect, useLayoutEffect, useRef, useState} from 'react';
 import DecisionDesk from './DecisionDesk.jsx';
+import TaskBoard from './TaskBoard.jsx';
 
 const ranks = {urgent: 0, normal: 1, later: 2};
 const emptyDraft = () => ({choice: '', memo: ''});
@@ -26,6 +27,8 @@ export default function App() {
     cases: [], view: 'pending', priority: 'all', selectedItem: null,
     draft: emptyDraft(), loading: true, saving: false, demo: false,
     notice: '', error: '', errorKind: '',
+    screen: new URLSearchParams(window.location.search).get('view') === 'tasks' ? 'tasks' : 'decisions',
+    lanes: [], taskChanges: {}, tasksLoading: true, taskError: '',
   });
   const current = useRef(state);
   current.current = state;
@@ -83,6 +86,24 @@ export default function App() {
         if (active) setState(previous => ({...previous, loading: false, errorKind: 'load',
           error: '案件を読み込めませんでした。表示中の内容と入力は保持しています。接続を確認してください。自動で再試行します。'}));
       } finally { refreshing.current = false; }
+      // task の失敗で判断の表示を止めない
+      try {
+        const data = await api('/api/tasks');
+        if (!active) return;
+        setState(previous => {
+          const before = new Map(previous.lanes.flatMap(lane => lane.tasks).map(task => [task.id, task.updated_at]));
+          const taskChanges = {...previous.taskChanges};
+          if (!previous.tasksLoading) {
+            for (const task of data.lanes.flatMap(lane => lane.tasks)) {
+              if (before.get(task.id) !== task.updated_at) taskChanges[task.id] = task.updated_at;
+            }
+          }
+          return {...previous, lanes: data.lanes, taskChanges, tasksLoading: false, taskError: ''};
+        });
+      } catch {
+        if (active) setState(previous => ({...previous, tasksLoading: false,
+          taskError: 'task を読み込めませんでした。表示中の内容は保持しています。自動で再試行します。'}));
+      }
     }
     refresh();
     const timer = setInterval(refresh, 5000);
@@ -96,6 +117,21 @@ export default function App() {
       selectedItem: previous.cases.find(item => item.id === id) || null,
       draft: drafts.current.get(id) || emptyDraft(), error: '', errorKind: '',
     }));
+  }
+
+  function changeScreen(screen) {
+    if (saving.current) return;
+    window.history.replaceState(null, '', screen === 'tasks' ? '/?view=tasks' : '/');
+    setState(previous => ({...previous, screen, error: '', errorKind: ''}));
+  }
+
+  function openDecision(id) {
+    const item = current.current.cases.find(candidate => candidate.id === id);
+    if (saving.current || !item) return;
+    window.history.replaceState(null, '', '/');
+    focusDetail.current = true;
+    setState(previous => ({...previous, screen: 'decisions', view: item.answer ? 'done' : 'pending', priority: 'all', selectedItem: item,
+      draft: drafts.current.get(id) || emptyDraft(), error: '', errorKind: ''}));
   }
 
   function changeView(view) {
@@ -203,5 +239,8 @@ export default function App() {
     detailRef={detailRef} onViewChange={changeView} onPriorityChange={changePriority} onSelect={select}
     onDraftChange={changeDraft} onSubmit={submit} onDefer={defer}
     onUndo={() => revise('undo')} onRetry={() => revise('retry')}
+    screen={state.screen} onScreenChange={changeScreen} taskError={state.taskError}
+    waitingTasks={state.lanes.filter(lane => ['human_decision', 'human_action'].includes(lane.id)).reduce((sum, lane) => sum + lane.tasks.length, 0)}
+    board={<TaskBoard lanes={state.lanes} changes={state.taskChanges} loading={state.tasksLoading} onOpenDecision={openDecision} />}
   />;
 }
