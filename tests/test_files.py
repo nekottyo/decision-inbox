@@ -88,6 +88,16 @@ class FileTests(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(len(files_root()), 2)
 
+    def test_途中がファイルや_symlink_ループのパスも理由付きで断る(self):
+        self.assertEqual(self.error(404, lambda: read_text_file(str(self.draft / 'child.md'), self.root)), 'ファイルが見つかりません')
+        loop = self.root / 'loop.md'
+        loop.symlink_to(loop)
+        self.assertIn('ファイルを開けません', self.error(400, lambda: read_text_file(str(loop), self.root)))
+        self.assertIn('ファイルを開けません', self.error(400, lambda: read_text_file(str(self.root / ('a' * 300)), self.root)))
+
+    def test_tui_で空の_root_を明示すると既定に戻さない(self):
+        self.assertEqual(Desk(self.store, files_root=[]).files_root, [])
+
     def test_root_自体が_symlink_でも中のファイルは読める(self):
         alias = Path(self.temp.name) / 'alias'
         alias.symlink_to(self.root)

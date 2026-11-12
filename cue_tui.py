@@ -273,7 +273,7 @@ NO_TMUX_NOTE = '。tmux が無いため端末は切り替えていません'
 class Desk:
     def __init__(self, store, web_url=None, focus=focus_pane, popup=False, files_root=None):
         self.store, self.web_url = store, web_url
-        self.files_root = files_root or default_files_root()
+        self.files_root = default_files_root() if files_root is None else files_root
         self.focus, self.popup = focus, popup
         self.items, self.item, self.drafts = [], None, {}
         self.view, self.priority, self.scroll = 'pending', 'all', 0

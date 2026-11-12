@@ -150,7 +150,7 @@ export default function DecisionDesk({
             {item.background && <section className="background-section"><h3>背景</h3><p className="background">{item.background}</p></section>}
             {imageUrl && <figure className="reference-image"><img src={imageUrl} alt={item.image.alt} referrerPolicy="no-referrer" /><figcaption>{item.image.alt}</figcaption></figure>}
             {links.length > 0 && <section className="related" aria-label="関連リンク"><h3>関連する PR・issue</h3><ul>{links.map((link, index) => <li key={`${link.url}-${index}`}><a href={safeUrl(link.url)} target="_blank" rel="noopener noreferrer"><span className="link-kind">{{ pr: 'PR', issue: 'issue', other: '参考' }[link.kind]}</span><span>{link.label}</span><span className="link-target">別タブで開く</span></a></li>)}</ul></section>}
-            {item.files?.length > 0 && <AttachedFiles key={item.id} item={item} />}
+            {item.files?.length > 0 && <AttachedFiles key={`${item.id}-${item.revision}`} item={item} />}
             <section className="recommendation" aria-labelledby="recommend-heading"><h3 id="recommend-heading">依頼元の推奨</h3><p>{item.recommendation}</p></section>
             {!item.answer && <form id="decision-form" onSubmit={event => { event.preventDefault(); if (!saving && draft.choice) onSubmit(); }}>
               <div className="option-list"><RadioList label="どう進めますか？" value={draft.choice} onChange={choice => onDraftChange({ ...draft, choice })} htmlName="choice" isRequired isDisabled={saving}>

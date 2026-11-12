@@ -170,6 +170,11 @@ def read_text_file(path, root):
         raise AppError(400, '通常のファイルではないため表示しません') from None
     except PermissionError:
         raise AppError(403, 'ファイルを読む権限がありません') from None
+    except NotADirectoryError:
+        raise AppError(404, 'ファイルが見つかりません') from None
+    except OSError as error:
+        # symlink ループや長すぎる名前など。素の OSError で漏らすと Web は 500、TUI は pager の失敗と誤って出る
+        raise AppError(400, f'ファイルを開けません ({error.strerror})') from None
     if len(raw) > FILE_LIMIT:
         raise AppError(413, f'{FILE_LIMIT // 1024} KiB を超えるファイルは表示しません')
     try:
