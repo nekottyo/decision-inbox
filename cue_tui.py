@@ -547,22 +547,32 @@ def detail_lines(desk, columns):
 
 def task_lines(desk, columns):
     counts = {key: sum(task['lane'] == key for task in desk.tasks) for key in LANES}
+    human = ('human_decision', 'human_action')
     # 人が動く lane を先に数える。並びの残りは LANES の順
-    order = sorted(LANES, key=lambda key: key not in ('human_decision', 'human_action'))
-    lines, selected = [' / '.join(f'{LANES[key]} {counts[key]}' for key in order)], None
+    order = sorted(LANES, key=lambda key: key not in human)
+    # 色は判断画面に合わせる (人が止めている = 止まった理由の色、回答済み = 推奨の色)。
+    # 色を出せない端末でも記号と文字で区別できるよう、色は補助にとどめる
+    styles = desk.heading_styles
+    waiting = styles.get('stopped', curses.A_BOLD)
+    answered = styles.get('recommendation', 0) & ~curses.A_BOLD
+    lines, selected = [(' / '.join(f'{LANES[key]} {counts[key]}' for key in order), curses.A_BOLD)], None
     for key, label in LANES.items():
-        lines.append(f'■ {label} ({counts[key]})')
+        lines.append((f"{'▲' if key in human else '■'} {label} ({counts[key]})", waiting if key in human else curses.A_BOLD))
         for task in desk.tasks:
             if task['lane'] != key:
                 continue
-            if task['id'] == desk.task_id:
-                selected = len(lines)
-            lines.append(f"  {task['title']}")
+            start = len(lines)
+            lines.append((f"{'>' if task['id'] == desk.task_id else ' '} {task['title']}", 0))
             updated = datetime.fromisoformat(task['updated_at']).astimezone().strftime('%m-%d %H:%M')
             parts = [f"担当 {task['pane']} {task['run']}".strip() if task['pane'] or task['run'] else '']
             parts += [f"残り {task['remaining']}" if task['remaining'] else '', f"結果 {task['result']}" if task['result'] else '']
-            parts += [f'判断 {decision_text(task)}' if task['decision_id'] else '', f'更新 {updated}']
-            lines.append('    ' + ' / '.join(part for part in parts if part))
+            parts.append(f'更新 {updated}')
+            lines.append(('    ' + ' / '.join(part for part in parts if part), 0))
+            if task['decision_id']:
+                decision = task['decision']
+                lines.append((f'    判断 {decision_text(task)}', answered if decision and decision['answered'] else waiting))
+            if task['id'] == desk.task_id:
+                selected = (start, len(lines) - 1)
     return lines, selected
 
 
@@ -633,16 +643,17 @@ def draw(screen, desk):
         elif desk.mode == 'tasks':
             # 読み込み失敗を 0 件と見分けられるよう、件数の代わりに失敗を出す
             lines, selected = task_lines(desk, columns)
-            put(0, 2, desk.task_error or 'task  ' + lines[0], curses.A_BOLD)
+            put(0, 2, desk.task_error or 'task  ' + lines[0][0], curses.A_BOLD)
             lines = lines[1:]
             visible = max(1, rows - 3)
             if selected is not None:
-                # 題名行と、その下の詳細行がはみ出さないように追従する
-                selected -= 1
-                desk.task_scroll = min(max(desk.task_scroll, selected + 2 - visible), selected)
+                # 題名行から判断の行までがはみ出さないように追従する
+                first, last = selected[0] - 1, selected[1] - 1
+                desk.task_scroll = min(max(desk.task_scroll, last + 1 - visible), first)
+                selected = first
             desk.task_scroll = min(max(0, desk.task_scroll), max(0, len(lines) - visible))
-            for offset, value in enumerate(lines[desk.task_scroll:desk.task_scroll + visible]):
-                put(1 + offset, 2, value, curses.A_REVERSE if desk.task_scroll + offset == selected else 0)
+            for offset, (value, attribute) in enumerate(lines[desk.task_scroll:desk.task_scroll + visible]):
+                put(1 + offset, 2, value, curses.A_REVERSE | curses.A_BOLD if desk.task_scroll + offset == selected else attribute)
             put(rows - 2, 2, desk.task_message, curses.A_BOLD)
             put(rows - 1, 2, '↑↓ 選択 / Enter 担当 pane へ移る / b で戻る')
         elif desk.mode == 'links':

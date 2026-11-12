@@ -376,7 +376,31 @@ class TaskTuiTests(unittest.TestCase):
             with patch('cue_tui.curses.doupdate'):
                 draw(screen, desk)
             self.assertGreater(desk.task_scroll, 0)
-            self.assertEqual(attributes['  件19'], curses.A_REVERSE)
+            self.assertEqual(attributes['> 件19'], curses.A_REVERSE | curses.A_BOLD)
+
+    def test_人待ちの_lane_と判断の状態を色と記号で分ける(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, desk = self.make(directory)
+            decision = store.add(request_payload(title='未回答の判断'))
+            store.add_task({'id': 'w1', 'title': '判断待ちの依頼', 'lane': 'human_decision', 'decision_id': decision['id']})
+            answered = store.add(request_payload(title='回答済みの判断', request_key='answered'))
+            store.answer(answered['id'], {'choice': 'minimal'})
+            store.add_task({'id': 'w2', 'title': '作業中の依頼', 'lane': 'worker', 'decision_id': answered['id']})
+            desk.refresh()
+            for styles in ({}, {'stopped': curses.A_BOLD | 0x100, 'recommendation': curses.A_BOLD | 0x200}):
+                desk.heading_styles = styles
+                attributes = {}
+                screen = Screen(40, 100)
+                screen.addstr = lambda row, column, value, attribute: attributes.__setitem__(value, attribute)
+                with patch('cue_tui.curses.doupdate'):
+                    draw(screen, desk)
+                waiting = styles.get('stopped', curses.A_BOLD)
+                self.assertEqual(attributes['▲ 人の判断待ち (1)'], waiting)
+                self.assertEqual(attributes['▲ 人の操作待ち (0)'], waiting)
+                self.assertEqual(attributes['■ 完了 (0)'], curses.A_BOLD)
+                self.assertEqual(next(value for key, value in attributes.items() if key.startswith('    判断 未回答 未回答の判断')), waiting)
+                answered = next(value for key, value in attributes.items() if key.startswith('    判断 回答済み'))
+                self.assertEqual(answered, styles.get('recommendation', 0) & ~curses.A_BOLD)
 
 
     def test_b_で_task_一覧を開閉できる(self):
