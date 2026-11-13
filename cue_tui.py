@@ -282,7 +282,7 @@ class Desk:
         self.jump_choice = False
         self.tasks, self.task_scroll, self.task_error = [], 0, ''
         self.task_index, self.task_id, self.task_message = 0, None, ''
-        # 完了は件数が溜まるので既定で畳む。開閉は画面の間だけ持ち、保存しない
+        # 完了は件数が溜まるので入るたびに畳む。開閉は task 画面の間だけ持ち、保存しない
         self.done_open = False
         self.heading_styles = {}
         self.refresh()
@@ -812,7 +812,8 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor, page=view_with_
         desk.mode = 'help'
     elif key == 'b':
         desk.refresh()
-        desk.mode, desk.task_scroll, desk.task_message = 'tasks', 0, ''
+        desk.mode, desk.task_scroll, desk.task_message, desk.done_open = 'tasks', 0, '', False
+        desk.sync_task()
     elif key == 'm':
         if desk.item and desk.item['answer'] is None:
             try:

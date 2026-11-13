@@ -319,6 +319,10 @@ class TaskTuiTests(unittest.TestCase):
             handle_key(desk, 'd')
             self.assertNotIn('終わった d1', screen_text())
             self.assertIn(desk.task_id, ('t1', 't2', 't3'))
+            handle_key(desk, 'd')
+            handle_key(desk, 'b')
+            handle_key(desk, 'b')
+            self.assertFalse(desk.done_open)
 
     def test_未知の_lane_の行があっても上下で_IndexError_にならない(self):
         with tempfile.TemporaryDirectory() as directory:
