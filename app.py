@@ -467,9 +467,9 @@ class Store:
                 raise AppError(400, '選択した候補が見つかりません')
             connection.execute("UPDATE decisions SET choice=?,memo=?,decided_at=?,status='pending' WHERE id=? AND choice IS NULL", (choice, memo, self.stamp(connection, identifier), identifier))
             # 回答の保存と task の移動を同じ transaction に置く。窓口が lane を手で動かし忘れ、
-            # 回答済みの判断が human_decision に残っていた (CLI / Web / TUI は全てここを通る)。
+            # 回答済みの判断が human_decision に残っていた (Web と TUI の回答はここを通る)。
             # undo では戻さない: 取り消しの後に窓口が何を待つかは機械で決められない
-            connection.execute("UPDATE tasks SET lane='todo',remaining=? || remaining,updated_at=? WHERE decision_id=? AND lane='human_decision'",
+            connection.execute("UPDATE tasks SET lane='todo',remaining=substr(?||remaining,1,2000),updated_at=? WHERE decision_id=? AND lane='human_decision'",
                                (f'Cue 回答済み: {choice}。', utc_now(), identifier))
         return self.get(identifier)
 

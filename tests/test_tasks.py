@@ -75,6 +75,9 @@ class TaskTests(unittest.TestCase):
         self.assertEqual((tasks['t1']['lane'], tasks['t1']['remaining']), ('todo', f'Cue 回答済み: {choice}。残り'))
         self.assertEqual((tasks['t2']['lane'], tasks['t2']['remaining']), ('worker', '残り'))
         self.assertEqual(tasks['t3']['lane'], 'human_decision')
+        answered = self.store.get(decision['id'])['answer']
+        self.store.undo(decision['id'], {'decided_at': answered['decided_at']})
+        self.assertEqual(next(t for t in self.store.tasks() if t['id'] == 't1')['lane'], 'todo')
 
     def test_一覧は_lane_順で_lane_内は作成順(self):
         for identifier, lane in [('b', 'done'), ('a', 'worker'), ('c', 'todo'), ('d', 'worker')]:

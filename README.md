@@ -75,7 +75,7 @@ Herdr は起動と popup の管理を担い、TUI の task 画面からは担当
 
 ## 依頼の進み具合を追う
 
-判断とは別に、依頼 (task) が今どの段階かを lane で追えます。task の登録と移動は CLI で行い、TUI と Web で確認します (TUI からは選んだ task の担当 pane へ移れます)。
+判断とは別に、依頼 (task) が今どの段階かを lane で追えます。task の登録と移動は CLI で行い (判断に回答すると、紐付く human_decision の task は todo へ移る)、TUI と Web で確認します (TUI からは選んだ task の担当 pane へ移れます)。
 
 ```sh
 python3 app.py task add --id fix-login --title "ログイン修正" --pane 1-2 --lane worker
