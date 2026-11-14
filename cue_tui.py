@@ -282,6 +282,8 @@ class Desk:
         self.jump_choice = False
         self.tasks, self.task_scroll, self.task_error = [], 0, ''
         self.task_index, self.task_id, self.task_message = 0, None, ''
+        # 完了は件数が溜まるので入るたびに畳む。開閉は task 画面の間だけ持ち、保存しない
+        self.done_open = False
         self.heading_styles = {}
         self.refresh()
 
@@ -344,7 +346,12 @@ class Desk:
 
     def ordered_tasks(self):
         # task 画面の表示順 (lane 順、lane 内は一覧順)
-        return [task for key in LANES for task in self.tasks if task['lane'] == key]
+        # 畳んだ完了は選べない (見えない行に選択が残らないようにする)
+        return [task for key in LANES if key != 'done' or self.done_open for task in self.tasks if task['lane'] == key]
+
+    def toggle_done(self):
+        self.done_open = not self.done_open
+        self.sync_task()
 
     def sync_task(self):
         # 一覧が変わっても同じ task id を保ち、消えたら範囲内に丸める
@@ -606,9 +613,11 @@ def task_lines(desk, columns):
     answered = styles.get('recommendation', 0) & ~curses.A_BOLD
     lines, selected = [(' / '.join(f'{LANES[key]} {counts[key]}' for key in order), curses.A_BOLD)], None
     for key, label in LANES.items():
-        lines.append((f"{'▲' if key in human else '■'} {label} ({counts[key]})", waiting if key in human and counts[key] else curses.A_BOLD))
+        folded = key == 'done' and not desk.done_open
+        mark = ('▸' if folded else '▾') if key == 'done' else '▲' if key in human else '■'
+        lines.append((f"{mark} {label} ({counts[key]})" + (' d で' + ('開く' if folded else '閉じる') if key == 'done' and counts[key] else ''), waiting if key in human and counts[key] else curses.A_BOLD))
         for task in desk.tasks:
-            if task['lane'] != key:
+            if task['lane'] != key or folded:
                 continue
             start = len(lines)
             lines.append((f"{'>' if task['id'] == desk.task_id else ' '} {task['title']}", 0))
@@ -705,7 +714,7 @@ def draw(screen, desk):
             for offset, (value, attribute) in enumerate(lines[desk.task_scroll:desk.task_scroll + visible]):
                 put(1 + offset, 2, value, curses.A_REVERSE | curses.A_BOLD if desk.task_scroll + offset == selected else attribute)
             put(rows - 2, 2, desk.task_message, curses.A_BOLD)
-            put(rows - 1, 2, '↑↓ 選択 / Enter 担当 pane へ移る / b で戻る')
+            put(rows - 1, 2, '↑↓ 選択 / Enter 担当 pane へ移る / d 完了の開閉 / b で戻る')
         elif desk.mode == 'links':
             put(1, 2, '関連リンク・ファイルを開く', curses.A_BOLD)
             visible = max(1, (rows - 5) // 2)
@@ -714,7 +723,7 @@ def draw(screen, desk):
                 put(3 + offset * 2, 2, label, curses.A_REVERSE if desk.menu_index == first + offset else 0)
             put(rows - 2, 2, '↑↓で選択、Enter で開く、Esc で閉じる')
         else:
-            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く、ファイルを $PAGER (既定 less) で読む', 'b: task (依頼の進み具合) を表示。↑↓ で選択、Enter で担当 pane へ移る', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
+            help_lines = ['Cue の操作', '', '↑↓ / j k: 候補を選択 (数字 1〜8 でも選択)', 'Enter: 選択した回答を保存し、次の未判断へ', '←→ / p n: 案件を移動', 'PageUp / PageDown: 本文をスクロール', 'Tab: 判断待ち / 判断済みを切り替え', 'u: 処理開始前の回答を取り消す', 't: 停止した案件の再処理を依頼する', 'f: 優先度の絞り込み', 'm: $VISUAL / $EDITOR (既定 vi) でメモを編集', 'r: データを再取得', 'w: 対象案件の Web 画面を開く', 'o: 関連する PR / issue を開く、ファイルを $PAGER (既定 less) で読む', 'b: task (依頼の進み具合) を表示。↑↓ で選択、Enter で担当 pane へ移る、d で完了 (既定は畳む) を開閉', 'Esc: 未保存入力を破棄して即終了', 'q: 終了 (未保存入力があれば確認)', '', 'Enter / ? で戻る、Esc で終了']
             for index, line in enumerate(help_lines):
                 put(index + 1, 2, line, curses.A_BOLD if index == 0 else 0)
     screen.noutrefresh()
@@ -735,6 +744,8 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor, page=view_with_
                 desk.move_task(1)
             elif key in ('\n', '\r', curses.KEY_ENTER):
                 return not desk.go_task()
+            elif key == 'd':
+                desk.toggle_done()
             elif key == 'r':
                 desk.refresh()
         elif desk.mode == 'help':
@@ -801,7 +812,8 @@ def handle_key(desk, key, page_height=10, edit=edit_with_editor, page=view_with_
         desk.mode = 'help'
     elif key == 'b':
         desk.refresh()
-        desk.mode, desk.task_scroll, desk.task_message = 'tasks', 0, ''
+        desk.mode, desk.task_scroll, desk.task_message, desk.done_open = 'tasks', 0, '', False
+        desk.sync_task()
     elif key == 'm':
         if desk.item and desk.item['answer'] is None:
             try:

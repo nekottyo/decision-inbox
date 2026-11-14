@@ -308,6 +308,37 @@ class TaskTuiTests(unittest.TestCase):
                 handle_key(desk, key)
                 self.assertEqual(desk.task_id, expected)
 
+    def test_完了は既定で畳まれ件数が見え_d_で開閉し畳むと選択が見える行へ戻る(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, desk = self.make(directory)
+            for identifier in ('d1', 'd2'):
+                store.add_task({'id': identifier, 'title': '終わった ' + identifier, 'lane': 'done', 'pane': 'w9:p9'})
+            desk.refresh()
+
+            def screen_text():
+                screen = Screen(24, 100)
+                with patch('cue_tui.curses.doupdate'):
+                    draw(screen, desk)
+                return '\n'.join(screen.output)
+            text = screen_text()
+            self.assertIn('完了 (2) d で開く', text)
+            self.assertNotIn('終わった d1', text)
+            for _ in range(5):
+                handle_key(desk, 'j')
+            self.assertEqual(desk.task_id, 't3')
+            handle_key(desk, 'd')
+            self.assertIn('完了 (2) d で閉じる', screen_text())
+            self.assertIn('終わった d1', screen_text())
+            handle_key(desk, 'j')
+            self.assertEqual(desk.task_id, 'd1')
+            handle_key(desk, 'd')
+            self.assertNotIn('終わった d1', screen_text())
+            self.assertIn(desk.task_id, ('t1', 't2', 't3'))
+            handle_key(desk, 'd')
+            handle_key(desk, 'b')
+            handle_key(desk, 'b')
+            self.assertFalse(desk.done_open)
+
     def test_未知の_lane_の行があっても上下で_IndexError_にならない(self):
         with tempfile.TemporaryDirectory() as directory:
             _, desk = self.make(directory)
@@ -383,6 +414,7 @@ class TaskTuiTests(unittest.TestCase):
             for number in range(20):
                 store.add_task({'id': f'x{number}', 'title': f'件{number}', 'lane': 'done'})
             desk.refresh()
+            handle_key(desk, 'd')
             for _ in range(22):
                 handle_key(desk, 'j')
             attributes = {}
@@ -430,7 +462,7 @@ class TaskTuiTests(unittest.TestCase):
                 waiting = styles.get('stopped', curses.A_BOLD)
                 self.assertEqual(attributes['▲ 人の判断待ち (1)'], waiting)
                 self.assertEqual(attributes['▲ 人の操作待ち (0)'], curses.A_BOLD)
-                self.assertEqual(attributes['■ 完了 (0)'], curses.A_BOLD)
+                self.assertEqual(attributes['▸ 完了 (0)'], curses.A_BOLD)
                 self.assertEqual(next(value for key, value in attributes.items() if key.startswith('    判断 未回答 未回答の判断')), waiting)
                 answered = next(value for key, value in attributes.items() if key.startswith('    判断 回答済み'))
                 self.assertEqual(answered, styles.get('recommendation', 0) & ~curses.A_BOLD)
