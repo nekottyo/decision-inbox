@@ -64,6 +64,21 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(self.status(self.store.update_task, 't1', {'lane': 'x'}), 400)
         self.assertEqual(self.status(self.store.add_task, {'id': 't2', 'title': 'a', 'lane': 'x'}), 400)
 
+    def test_回答すると紐付く_human_decision_の_task_だけ_todo_へ移る(self):
+        decision = self.store.add(request_payload())
+        other = self.store.add(request_payload(title='別の判断'))
+        for identifier, lane, decision_id in (('t1', 'human_decision', decision['id']), ('t2', 'worker', decision['id']), ('t3', 'human_decision', other['id'])):
+            self.store.add_task({'id': identifier, 'title': identifier, 'lane': lane, 'decision_id': decision_id, 'remaining': '残り'})
+        choice = decision['options'][0]['id']
+        self.store.answer(decision['id'], {'choice': choice})
+        tasks = {task['id']: task for task in self.store.tasks()}
+        self.assertEqual((tasks['t1']['lane'], tasks['t1']['remaining']), ('todo', f'Cue 回答済み: {choice}。残り'))
+        self.assertEqual((tasks['t2']['lane'], tasks['t2']['remaining']), ('worker', '残り'))
+        self.assertEqual(tasks['t3']['lane'], 'human_decision')
+        answered = self.store.get(decision['id'])['answer']
+        self.store.undo(decision['id'], {'decided_at': answered['decided_at']})
+        self.assertEqual(next(t for t in self.store.tasks() if t['id'] == 't1')['lane'], 'todo')
+
     def test_一覧は_lane_順で_lane_内は作成順(self):
         for identifier, lane in [('b', 'done'), ('a', 'worker'), ('c', 'todo'), ('d', 'worker')]:
             self.store.add_task({'id': identifier, 'title': identifier, 'lane': lane})
