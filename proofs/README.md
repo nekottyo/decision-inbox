@@ -26,6 +26,7 @@ lean +leanprover/lean4:v4.36.0 proofs/DecisionSnapshot.lean
 lean +leanprover/lean4:v4.36.0 proofs/SessionRegistry.lean
 lean +leanprover/lean4:v4.36.0 proofs/ReleaseSwitch.lean
 lean +leanprover/lean4:v4.36.0 proofs/DeliveryAttempt.lean
+lean +leanprover/lean4:v4.36.0 proofs/CheckRunner.lean
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
@@ -75,3 +76,24 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ## 公開 release の切り替え
 
 [ReleaseSwitch.lean](ReleaseSwitch.lean) は事前検証の成功後にだけ候補を有効にできること、事前検証の失敗で現行 release が残ること、切り替え後の検査に失敗した場合に復旧が成功すれば旧 release に戻ることを扱う。更新コマンドではファイルロックにより一度に一件だけ更新を進め、`current` の入れ替えに同一ファイルシステム内の atomic rename を使う。モデルは処理段階とリンク先を別々に持つ。同じ rename の境界で旧 release、候補、外部のリンク先を観測でき、割り込み時はその観測から復元の要否を決める。再起動した PID と Web の待ち受けが一致しない観測は成功への遷移に進めない。SHA-256、アーカイブの検証、SQLite の互換性、Web と Herdr の確認は更新コマンドを入口とする Python の回帰テストで扱う。プロセスの強制終了、他の手段による同時書き換え、外部サービスの恒久障害はモデルの対象外。別の参照先を観測したときは処理を停止し、復元を含む後続の書き換えは行わない。
+
+## check runner の due 判定・重複抑制・故障 counter
+
+[CheckRunner.lean](CheckRunner.lean) と [CheckRunner.als](CheckRunner.als) は、`app.py check tick` が扱う due 判定・`(check, kind, dedup_key)` 単位の重複抑制・故障 counter と故障タスクの状態遷移・起票上限 (20 件) を検査する。
+
+- **due 判定**: 履歴なし・時刻巻き戻り (`last_started` または `last_actual_started_at` が `tick_started` より未来) は即 due。通常時は成功系 (`ok_silent` / `fired` / `suppressed` / `mixed`) の後は `last_started`、失敗系 (`failed_exit` / `failed_timeout` / `failed_output`) の後は `last_actual_started_at` を基準とし、`tick_started + grace >= base + interval` (`grace = min(30, interval / 10)`) で判定する。失敗系では `actual_started_at >= tick_started` より実開始時刻同士の間隔も `interval - grace` を下回らないことを証明する
+- **outcome 優先順位と aborted**: 優先順位は `failed_timeout > aborted > failed_exit > failed_output > 正常系`。期限切れ時の `failed_timeout` / `aborted` は観測時刻ではなく先に到来した deadline (`timeout_at <= tick_deadline` なら `failed_timeout`、そうでなければ `aborted`) で決定する。`aborted` は非決定的に発生し得る遷移として扱い、`checks` の実行状態カラム (`last_started` / `last_actual_started_at` / `last_outcome` / `fault_count`) を一切変更しないため、`last_outcome` が `aborted` になることは決してない
+- **故障 counter と名前空間分離**: 成功系で `fault_count` を 0 に戻す。失敗系は未完了の故障タスク (`kind=fault`, `dedup_key=""`) がある間は `fault_count` を 0 のまま維持して二重起票せず、無いときは `fault_count + 1` が `fault_threshold` 以上で故障タスクを 1 件起票して `fault_count` を 0 に戻す。`kind=event` と `kind=fault` は別名前空間であり、空文字の `dedup_key` でも互いに抑制し合わない。TOML 同期で `command` 変更または無効化が起きたときは `fault_count` を 0 に戻し、`env` / `timeout` のみの変更では保持する
+- **起票上限と Liveness**: 1 回の実行で新規起票するタスクは上限 (20 件) 以下で、`suppressed` なイベントは上限枠を消費しない。Liveness として、初期条件 (`fault_threshold >= 1`、`fault_count = 0`、および対象 check の未完了故障タスク (`kind=fault`, `dedup_key=""`) が存在しないこと) と、前処理時間が 60 秒未満に収まる tick が繰り返し発生し途中で別途故障タスクが増えないまま非 `aborted` な失敗が連続するという公平性仮定の下で、`fault_threshold` 回目の失敗で必ず故障タスクが起票されることを証明する (前処理時間の上限自体は公理にしない)。未完了の故障タスクが既に存在する間は上記の重複起票抑止により `fault_count` が 0 のまま保たれて新しい故障タスクは作られず、既存の故障タスクが完了して初期条件に戻った後に改めてカウントが始まる
+- **4 段階 tick 予算と絶対期限**: [CheckRunner.lean](CheckRunner.lean) の `TickBudget` / `phaseDeadline` / `cappedMirrorBusy` により、`monoStart ≤ execDeadline ≤ commitStartDeadline ≤ endWorkDeadline ≤ tickDeadline` の単調順を証明する。cleanup の各フェーズ (SIGTERM 猶予 → SIGKILL 回収待ち → drain join) は開始時点の単一時刻サンプルと絶対期限 `commitStartDeadline` の最小値 `min(phaseStart + configured, cleanupDeadline)` で上限するため、定時開始では設定どおりの猶予を保ちつつ、任意の遅延が入っても `commitStartDeadline` を超えず、cleanup が `commitStartDeadline` 内に完了する限り `effectiveCommit` の全量が `endWorkDeadline` まで残ることを証明する。また `sync_checks_mirror` の DB 待ち時間も `endWorkDeadline` までの残り作業時間で上限 (`cappedMirrorBusy`) し、残り時間が無ければ残り予算が 0 になることを証明する。mirror 書き込みを実際に開始しない (skip する) 判断は証明ではなく実装 `run_check_tick` による: `mirror_rem <= 0` のとき `sync_checks_mirror` を呼ばずに `aborted` で終了する (`app.py:3264-3266`)
+
+| モデル | 実装 |
+| --- | --- |
+| `grace` / `isClockAnomaly` / `dueBase` / `isDue` | `check_is_due` が `tick_started` 固定で due 判定・巻き戻り検知を実施 |
+| `classifyOutcome` | `run_check_command` が支配的な deadline (`timeout_at <= tick_deadline` か) で `timed_out` / `aborted` を確定し、`commit_check_run` が `failed_timeout > aborted > failed_exit > failed_output > 正常系` で決定 |
+| `hasIncomplete` / `processEvents` | `commit_check_run` が `BEGIN IMMEDIATE` 内で `(check_name, kind, dedup_key)` 単位の未完了タスク (`tasks.lane != 'done'`) を照合し、上限 20 件で新規起票・`suppressed`・`events_deferred` を確定 |
+| `applyOutcome` | `commit_check_run` が 1 つの `BEGIN IMMEDIATE` 内で `check_runs` / `check_run_events` / `tasks` / `check_tasks` / `checks` を更新 (`aborted` は `check_runs` のみ) |
+| `syncFaultCount` | `sync_checks_mirror` が `command` 変更または無効化時に `fault_count = 0` へリセット |
+| `TickBudget` / `phaseDeadline` / `cappedMirrorBusy` | `run_check_tick` が 4 段階期限 (`exec_deadline` / `commit_start_deadline` / `end_work_deadline` / `tick_deadline`) を算出し、`_terminate_process_group` と `run_check_command` が絶対期限 `cleanup_deadline` と同一時計 `mono_fn` で各フェーズを上限。mirror 同期は `end_work_deadline` までの残り作業時間で `busy_timeout_ms` を上限し、残量 0 以下なら書き込みを開始せず終了処理へ進む |
+
+前提は、flock により tick が直列化されること、SQLite の `BEGIN IMMEDIATE` が 1 check 実行の確定を原子的に直列化すること、および単調時計が逆行しないこと。モデルの期限検証は各フェーズが計算上の期限を厳密に守る理想時計上の境界を扱い、OS スケジューリングによる待ち復帰オーバーヘッドや `SIGKILL` 後の uninterruptible sleep (D-state)、finalization 中も別 writer が DB ロックを保持し続けるケース (best-effort 終了処理の限界) は対象外。flock の競合・skip 記録、git checkout 検査、TOML 検証、JSONL 64KiB/スキーマ検証、プロセスグループ SIGTERM/SIGKILL・割り込み時 cleanup、run-inbox への wake (20 秒上限・CB・回収)、実プロセス遅延・SQLite ロック競合下の予算境界テスト、30 日 prune、`PRAGMA user_version = 2` 互換は `tests/test_checks.py` で検査する。

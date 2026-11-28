@@ -3,6 +3,8 @@
 import argparse
 from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
+import errno
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -16,7 +18,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tomllib
 from urllib.parse import unquote, urlsplit
 import uuid
 
@@ -1878,6 +1882,1703 @@ def list_claims(store, directory, identifier=None):
     return {'claims': claims}
 
 
+CHECK_TICK_BUDGET_SEC = 240.0
+CHECK_FINALIZE_RESERVE_SEC = 2.0
+CHECK_COMMIT_RESERVE_SEC = 2.0
+CHECK_COMMIT_BUSY_TIMEOUT_MS = 5000
+CHECK_WAKE_PASS_BUDGET_SEC = 20.0
+CHECK_WAKE_ITEM_TIMEOUT_SEC = 5.0
+CHECK_WAKE_CB_LIMIT = 2
+CHECK_GIT_TIMEOUT_SEC = 5.0
+CHECK_MAX_TIMEOUT_SEC = 180.0
+CHECK_MAX_FAULT_THRESHOLD = (1 << 63) - 1
+CHECK_KILL_GRACE_SEC = 5.0
+CHECK_INTERRUPT_KILL_GRACE_SEC = 0.5
+CHECK_KILL_WAIT_SEC = 1.0
+CHECK_DRAIN_JOIN_SEC = 0.5
+CHECK_STDOUT_LIMIT = 65536
+CHECK_STDERR_LIMIT = 65536
+CHECK_EXCERPT_LIMIT = 4096
+CHECK_EVENT_CAP = 20
+CHECK_RETENTION_DAYS = 30
+CHECK_PRUNE_BATCH = 200
+CHECK_FAULT_SKILL = 'check-fault'
+CHECK_KEY_RE = re.compile(r'^[A-Za-z0-9._/-]{1,200}$')
+CHECK_SUCCESS_OUTCOMES = ('ok_silent', 'fired', 'suppressed', 'mixed')
+CHECK_FAILURE_OUTCOMES = ('failed_exit', 'failed_timeout', 'failed_output')
+CHECK_ALL_OUTCOMES = (*CHECK_SUCCESS_OUTCOMES, *CHECK_FAILURE_OUTCOMES, 'aborted')
+CHECK_ALLOWED_KEYS = frozenset({'name', 'interval', 'command', 'timeout', 'skill', 'env', 'fault_threshold', 'enabled'})
+
+
+class CheckConfigError(Exception):
+    """checkout 検査または checks.toml の検証失敗。tick 全体を config_error として止める。"""
+
+
+def _parse_check_now_env():
+    """テスト用の現在時刻注入 (CUE_CHECK_NOW: epoch 秒または timezone 付き ISO 8601)。"""
+    raw = os.environ.get('CUE_CHECK_NOW')
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+        if math.isfinite(value):
+            return value
+    except ValueError:
+        pass
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _iso_utc(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec='microseconds')
+
+
+def _parse_iso_ts(value):
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _has_surrogate(value):
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
+
+
+def _excerpt_4k(raw):
+    """バイト列を最大 4KiB の有効な UTF-8 文字列抜粋にする。"""
+    if not raw:
+        return ''
+    text_out = raw[:CHECK_EXCERPT_LIMIT].decode('utf-8', errors='replace')
+    encoded = text_out.encode('utf-8')
+    if len(encoded) <= CHECK_EXCERPT_LIMIT:
+        return text_out
+    # U+FFFD 置換で 4KiB をわずかに超えた場合だけ末尾文字を削って 4KiB 以内に収める
+    while len(text_out.encode('utf-8')) > CHECK_EXCERPT_LIMIT:
+        text_out = text_out[:-1]
+    return text_out
+
+
+def _resolve_check_db_path(db_path):
+    """DB パスの symlink を解決した実体パスを返す。"""
+    return Path(db_path).expanduser().resolve()
+
+
+def check_lock_path(db_path):
+    """DB と同じ永続ディレクトリに置く固定パスの flock 用 lockfile。終了時に unlink しない。"""
+    target = _resolve_check_db_path(db_path)
+    return target.parent / (target.name + '.check.lock')
+
+
+def default_run_inbox_bin():
+    override = os.environ.get('CUE_RUN_INBOX_BIN')
+    if override:
+        return override
+    candidate = Path.home() / '.claude' / 'skills' / 'herdr-orchestrate' / 'scripts' / 'run-inbox.sh'
+    return str(candidate) if candidate.exists() else 'run-inbox.sh'
+
+
+@contextmanager
+def _check_db(db_path, *, busy_timeout_ms=5000):
+    """check runner 用の DB 接続。WAL 切替や DDL は行わない (flock 取得後の初期化のみが行う)。"""
+    resolved = _resolve_check_db_path(db_path)
+    timeout_ms = max(0, int(busy_timeout_ms))
+    connection = sqlite3.connect(str(resolved), timeout=timeout_ms / 1000.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute(f'PRAGMA busy_timeout={timeout_ms}')
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
+def ensure_check_schema(db_path):
+    """flock 取得後の (1)〜(2) の間でのみ呼ぶ。WAL 切替と additive テーブル作成を行う (user_version は 2 のまま)。"""
+    resolved = _resolve_check_db_path(db_path)
+    Store(resolved)
+    connection = sqlite3.connect(str(resolved), timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute('PRAGMA busy_timeout=5000')
+        connection.execute('PRAGMA journal_mode=WAL')
+        with connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute('''CREATE TABLE IF NOT EXISTS checks (
+                name TEXT PRIMARY KEY,
+                interval REAL NOT NULL,
+                command TEXT NOT NULL,
+                timeout REAL NOT NULL,
+                skill TEXT NOT NULL,
+                env TEXT NOT NULL DEFAULT '{}',
+                fault_threshold INTEGER NOT NULL DEFAULT 3,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                toml_order INTEGER NOT NULL DEFAULT 0,
+                last_started TEXT,
+                last_actual_started_at TEXT,
+                last_outcome TEXT,
+                fault_count INTEGER NOT NULL DEFAULT 0,
+                prev_command TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL)''')
+            connection.execute('''CREATE TABLE IF NOT EXISTS check_runs (
+                id INTEGER PRIMARY KEY,
+                tick_id INTEGER NOT NULL,
+                check_name TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                exit_code INTEGER,
+                outcome TEXT NOT NULL,
+                stdout_excerpt TEXT NOT NULL DEFAULT '',
+                stderr_excerpt TEXT NOT NULL DEFAULT '',
+                events_deferred INTEGER NOT NULL DEFAULT 0,
+                clock_anomaly INTEGER NOT NULL DEFAULT 0)''')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_runs_started ON check_runs(started_at)')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_runs_check ON check_runs(check_name, id)')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_runs_tick ON check_runs(tick_id)')
+            connection.execute('''CREATE TABLE IF NOT EXISTS check_run_events (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                dedup_key TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL,
+                task_id TEXT,
+                suppressed_by_task_id TEXT)''')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_run_events_run ON check_run_events(run_id)')
+            connection.execute('''CREATE TABLE IF NOT EXISTS check_ticks (
+                id INTEGER PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                wake_failed INTEGER NOT NULL DEFAULT 0,
+                unnotified_tasks INTEGER NOT NULL DEFAULT 0,
+                checks_deferred INTEGER)''')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_ticks_started ON check_ticks(started_at)')
+            connection.execute('''CREATE TABLE IF NOT EXISTS check_tasks (
+                task_id TEXT PRIMARY KEY,
+                check_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                dedup_key TEXT NOT NULL DEFAULT '',
+                skill TEXT NOT NULL,
+                needs_wake INTEGER NOT NULL DEFAULT 1,
+                notified_at TEXT,
+                last_wake_attempt_at TEXT,
+                created_at TEXT NOT NULL)''')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_tasks_dedup ON check_tasks(check_name, kind, dedup_key)')
+            connection.execute('CREATE INDEX IF NOT EXISTS check_tasks_wake ON check_tasks(needs_wake) WHERE needs_wake=1')
+    finally:
+        connection.close()
+
+
+def _record_skipped_tick(db_path, started_iso):
+    """ロック不取得時の最小 skip 記録。DDL・WAL 切替は行わず、競合で書けない場合は stderr に残して終了する。"""
+    resolved = _resolve_check_db_path(db_path)
+    if not resolved.exists():
+        print('warning: check tick skipped (lock held, DB not initialized)', file=sys.stderr)
+        return None
+    connection = None
+    try:
+        # ブロックし続けないよう短い timeout にする
+        connection = sqlite3.connect(str(resolved), timeout=0.5)
+        connection.execute('PRAGMA busy_timeout=500')
+        with connection:
+            cursor = connection.execute(
+                "INSERT INTO check_ticks(started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred) VALUES(?, ?, 'skipped', 0, 0, NULL)",
+                (started_iso, started_iso),
+            )
+            return cursor.lastrowid
+    except sqlite3.Error as error:
+        print(f'warning: check tick skipped (failed to record skip: {error})', file=sys.stderr)
+        return None
+    finally:
+        if connection is not None:
+            with suppress(sqlite3.Error):
+                connection.close()
+
+
+def _pgid_alive(pgid):
+    """プロセスグループ pgid に残存プロセスがあるか確認する。"""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_process_group(
+    process, grace_sec, *, kill_wait_sec=CHECK_KILL_WAIT_SEC,
+    deadline=None, tail_reserve_sec=0.0, mono_fn=time.monotonic,
+):
+    """プロセスグループ全体へ SIGTERM → grace_sec 猶予後に残存があれば SIGKILL。
+    deadline (mono_fn 基準の絶対期限) が指定されている場合、SIGTERM 猶予と SIGKILL 後の回収待ちを
+    その絶対期限内に収める。各フェーズ開始時点の単一時刻サンプルと deadline の最小値でフェーズ期限を決め、
+    開始遅延や後から取った時刻への加算で cleanup 窓が後ろへずれないようにする。"""
+    pgid = process.pid
+    with suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(pgid, signal.SIGTERM)
+
+    grace_cap = max(0.0, float(grace_sec))
+    kill_wait_cap = max(0.0, float(kill_wait_sec))
+    tail_cap = max(0.0, float(tail_reserve_sec))
+
+    term_start = mono_fn()
+    if deadline is None:
+        grace_budget = grace_cap
+        kill_wait_budget = kill_wait_cap
+        term_deadline = term_start + grace_budget
+    else:
+        cleanup_rem = max(0.0, deadline - term_start)
+        total_cap = grace_cap + kill_wait_cap + tail_cap
+        if total_cap <= 0 or cleanup_rem <= 0:
+            grace_budget = 0.0
+            kill_wait_budget = 0.0
+        elif cleanup_rem >= total_cap:
+            grace_budget = grace_cap
+            kill_wait_budget = kill_wait_cap
+        else:
+            scale = cleanup_rem / total_cap
+            grace_budget = grace_cap * scale
+            kill_wait_budget = kill_wait_cap * scale
+        term_deadline = min(term_start + grace_budget, deadline)
+
+    term_real_deadline = time.monotonic() + max(0.0, term_deadline - term_start)
+    while True:
+        remaining = min(term_deadline - mono_fn(), term_real_deadline - time.monotonic())
+        if process.returncode is None:
+            if remaining > 0:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    break
+            else:
+                process.poll()
+                if process.returncode is None:
+                    break
+        # リーダー終了済み (reap 済み)。グループ内の子孫残存を killpg(pgid, 0) で確認する
+        if not _pgid_alive(pgid):
+            return
+        remaining = min(term_deadline - mono_fn(), term_real_deadline - time.monotonic())
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+
+    if process.returncode is None or _pgid_alive(pgid):
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+    kill_wait_start = mono_fn()
+    kill_wait_deadline = kill_wait_start + kill_wait_budget
+    if deadline is not None:
+        kill_wait_deadline = min(kill_wait_deadline, deadline)
+    kill_wait_effective = max(0.0, kill_wait_deadline - kill_wait_start)
+    kill_wait_real_deadline = time.monotonic() + kill_wait_effective
+    leader_wait_timed_out = False
+    if process.returncode is None:
+        wait_remaining = min(
+            kill_wait_deadline - mono_fn(),
+            kill_wait_real_deadline - time.monotonic(),
+        )
+        if wait_remaining > 0:
+            try:
+                process.wait(timeout=wait_remaining)
+            except subprocess.TimeoutExpired:
+                leader_wait_timed_out = True
+            except OSError:
+                pass
+        else:
+            process.poll()
+            if process.returncode is None:
+                leader_wait_timed_out = True
+    while _pgid_alive(pgid):
+        wait_remaining = min(
+            kill_wait_deadline - mono_fn(),
+            kill_wait_real_deadline - time.monotonic(),
+        )
+        if wait_remaining <= 0:
+            break
+        time.sleep(min(0.01, wait_remaining))
+    if leader_wait_timed_out or process.returncode is None or _pgid_alive(pgid):
+        print(
+            f'warning: process group {pgid} did not terminate within {kill_wait_effective:.2f}s after SIGKILL',
+            file=sys.stderr,
+        )
+
+
+def _run_subprocess_bounded(argv, *, cwd=None, env=None, timeout=5.0, kill_grace=0.5):
+    """プロセスグループで実行し、タイムアウトや割り込み時はグループごと確実に終了させる。"""
+    try:
+        process = subprocess.Popen(
+            argv, cwd=cwd, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as error:
+        return None, b'', str(error).encode('utf-8', errors='replace'), False
+    try:
+        out, err = process.communicate(timeout=max(0.01, timeout))
+        return process.returncode, out, err, False
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process, kill_grace)
+        with suppress(OSError, ValueError):
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+        return None, b'', b'timeout', True
+    except BaseException:
+        # KeyboardInterrupt 等で抜ける前にプロセスグループを上限付きで停止・回収する
+        _terminate_process_group(process, min(kill_grace, CHECK_INTERRUPT_KILL_GRACE_SEC))
+        with suppress(OSError, ValueError):
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+        raise
+
+
+def _run_git_checked(args, cwd, deadline, mono_fn):
+    remaining = deadline - mono_fn()
+    if remaining <= 0:
+        raise CheckConfigError('git checkout 検査が 5 秒の上限を超過しました')
+    rc, out, err, timed_out = _run_subprocess_bounded(['git', '-C', str(cwd), *args], timeout=remaining, kill_grace=0.5)
+    if timed_out or mono_fn() > deadline:
+        raise CheckConfigError('git checkout 検査が 5 秒の上限を超過しました')
+    if rc != 0:
+        detail = err.decode('utf-8', errors='replace').strip()
+        raise CheckConfigError(f'git checkout 検査に失敗しました: {detail or rc}')
+    return out.decode('utf-8', errors='replace')
+
+
+def load_and_validate_checks_config(config_path, *, mono_fn=time.monotonic, git_timeout=CHECK_GIT_TIMEOUT_SEC):
+    """checkout の整合性 (main ブランチ・tracked clean・合計 5 秒上限) と checks.toml を全件検証する。"""
+    path = Path(config_path).expanduser()
+    if not path.is_file():
+        raise CheckConfigError(f'checks.toml が見つかりません: {config_path}')
+    config_dir = path.parent.resolve()
+    git_deadline = mono_fn() + git_timeout
+    top_out = _run_git_checked(['rev-parse', '--show-toplevel'], config_dir, git_deadline, mono_fn).strip()
+    if not top_out:
+        raise CheckConfigError('checks.toml のディレクトリが git リポジトリではありません')
+    checkout_root = os.path.realpath(top_out)
+    real_config = os.path.realpath(path)
+    try:
+        if os.path.commonpath([checkout_root, real_config]) != checkout_root:
+            raise CheckConfigError('checks.toml の実体が checkout 配下にありません')
+    except ValueError:
+        raise CheckConfigError('checks.toml の実体が checkout 配下にありません') from None
+
+    branch = _run_git_checked(['symbolic-ref', '--quiet', '--short', 'HEAD'], checkout_root, git_deadline, mono_fn).strip()
+    if branch != 'main':
+        raise CheckConfigError(f'checkout のブランチが main ではありません: {branch or "(detached)"}')
+
+    status = _run_git_checked(['-c', 'core.quotepath=false', 'status', '--porcelain', '--untracked-files=no'], checkout_root, git_deadline, mono_fn)
+    if status.strip():
+        raise CheckConfigError('checkout の tracked ファイルに未コミットの変更があります')
+
+    try:
+        raw_text = path.read_text(encoding='utf-8')
+        parsed = tomllib.loads(raw_text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise CheckConfigError(f'checks.toml の読み込みに失敗しました: {error}') from None
+
+    if not isinstance(parsed, dict):
+        raise CheckConfigError('checks.toml の最上位はテーブルである必要があります')
+    unknown_top = set(parsed) - {'checks'}
+    if unknown_top:
+        raise CheckConfigError(f'checks.toml に未知の最上位キーがあります: {", ".join(sorted(unknown_top))}')
+    raw_checks = parsed.get('checks')
+    if not isinstance(raw_checks, list):
+        raise CheckConfigError('checks.toml には [[checks]] 配列が必要です')
+
+    validated = []
+    seen_names = set()
+    for index, entry in enumerate(raw_checks):
+        if not isinstance(entry, dict):
+            raise CheckConfigError(f'checks[{index}] はテーブルである必要があります')
+        unknown_keys = set(entry) - CHECK_ALLOWED_KEYS
+        if unknown_keys:
+            raise CheckConfigError(f'checks[{index}] に未知の項目があります: {", ".join(sorted(unknown_keys))}')
+
+        name = entry.get('name')
+        if not isinstance(name, str) or not name.strip() or '\x00' in name or _has_surrogate(name):
+            raise CheckConfigError(f'checks[{index}].name は非空の文字列である必要があります')
+        if name in seen_names:
+            raise CheckConfigError(f'checks.toml 内で name が重複しています: {name}')
+        seen_names.add(name)
+
+        timeout = entry.get('timeout')
+        try:
+            timeout_val = None if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) else float(timeout)
+        except OverflowError:
+            timeout_val = None
+        if timeout_val is None or not math.isfinite(timeout_val) or not (0 < timeout_val <= CHECK_MAX_TIMEOUT_SEC):
+            raise CheckConfigError(f'check {name!r} の timeout は 0 < timeout <= {int(CHECK_MAX_TIMEOUT_SEC)} である必要があります')
+
+        interval = entry.get('interval')
+        try:
+            interval_val = None if isinstance(interval, bool) or not isinstance(interval, (int, float)) else float(interval)
+        except OverflowError:
+            interval_val = None
+        if interval_val is None or not math.isfinite(interval_val) or interval_val <= 0:
+            raise CheckConfigError(f'check {name!r} の interval は正の数である必要があります')
+
+        fault_threshold = entry.get('fault_threshold', 3)
+        if isinstance(fault_threshold, bool) or not isinstance(fault_threshold, int) or not (1 <= fault_threshold <= CHECK_MAX_FAULT_THRESHOLD):
+            raise CheckConfigError(
+                f'check {name!r} の fault_threshold は 1 以上 {CHECK_MAX_FAULT_THRESHOLD} 以下の整数である必要があります'
+            )
+
+        skill = entry.get('skill')
+        if not isinstance(skill, str) or not skill.strip() or '\x00' in skill or _has_surrogate(skill):
+            raise CheckConfigError(f'check {name!r} の skill は非空の文字列である必要があります')
+
+        enabled = entry.get('enabled', True)
+        if not isinstance(enabled, bool):
+            raise CheckConfigError(f'check {name!r} の enabled は真偽値である必要があります')
+
+        env_raw = entry.get('env', {})
+        if not isinstance(env_raw, dict):
+            raise CheckConfigError(f'check {name!r} の env はテーブルである必要があります')
+        env_clean = {}
+        for env_key, env_val in env_raw.items():
+            if (
+                not isinstance(env_key, str) or not env_key or '\x00' in env_key or '=' in env_key or _has_surrogate(env_key)
+                or not isinstance(env_val, str) or '\x00' in env_val or _has_surrogate(env_val)
+            ):
+                raise CheckConfigError(f'check {name!r} の env は有効なキーと文字列の組である必要があります')
+            env_clean[env_key] = env_val
+
+        command_raw = entry.get('command')
+        if isinstance(command_raw, str):
+            if not command_raw.strip() or '\x00' in command_raw:
+                raise CheckConfigError(f'check {name!r} の command が不正です')
+            cmd_path = command_raw
+            cmd_args = []
+        elif isinstance(command_raw, list) and command_raw and all(isinstance(part, str) and '\x00' not in part for part in command_raw):
+            if not command_raw[0].strip():
+                raise CheckConfigError(f'check {name!r} の command[0] が空です')
+            cmd_path = command_raw[0]
+            cmd_args = command_raw[1:]
+        else:
+            raise CheckConfigError(f'check {name!r} の command はパス文字列または非空の文字列配列である必要があります')
+
+        candidate = Path(cmd_path) if os.path.isabs(cmd_path) else (config_dir / cmd_path)
+        real_cmd = os.path.realpath(candidate)
+        try:
+            inside = os.path.commonpath([checkout_root, real_cmd]) == checkout_root and real_cmd != checkout_root
+        except ValueError:
+            inside = False
+        if not inside:
+            raise CheckConfigError(f'check {name!r} の command は checkout 配下を指す必要があります: {cmd_path}')
+        if not os.path.isfile(real_cmd):
+            raise CheckConfigError(f'check {name!r} の command ファイルが見つかりません: {cmd_path}')
+
+        resolved_argv = [real_cmd, *cmd_args]
+        # 文字列形 ('["probe"]') と配列形 (["probe"]) が衝突しないよう、配列 JSON として一意に表現する
+        canonical_cmd = json.dumps([cmd_path, *cmd_args], ensure_ascii=False)
+        command_identity = json.dumps(resolved_argv, ensure_ascii=False)
+
+        validated.append({
+            'name': name,
+            'interval': interval_val,
+            'command': canonical_cmd,
+            'command_identity': command_identity,
+            'argv': resolved_argv,
+            'timeout': timeout_val,
+            'skill': skill,
+            'env': env_clean,
+            'fault_threshold': fault_threshold,
+            'enabled': enabled,
+            'toml_order': index,
+        })
+
+    return checkout_root, config_dir, validated
+
+
+def sync_checks_mirror(db_path, checks_cfg, now_iso, *, busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS):
+    """TOML 定義を checks テーブルへ鏡同期する。TOML に無い定義は無効化し履歴を残す。
+    command 変更または無効化時のみ fault_count を 0 に戻す (env / timeout のみの変更では戻さない)。"""
+    with _check_db(db_path, busy_timeout_ms=busy_timeout_ms) as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        existing = {row['name']: dict(row) for row in connection.execute('SELECT * FROM checks')}
+        seen = set()
+        for item in checks_cfg:
+            name = item['name']
+            seen.add(name)
+            env_json = json.dumps(item['env'], ensure_ascii=False, sort_keys=True)
+            enabled_int = 1 if item['enabled'] else 0
+            if name in existing:
+                prev = existing[name]
+                command_changed = prev['prev_command'] != item['command_identity']
+                fault_count = 0 if (command_changed or not item['enabled']) else prev['fault_count']
+                connection.execute(
+                    '''UPDATE checks
+                       SET interval=?, command=?, timeout=?, skill=?, env=?, fault_threshold=?,
+                           enabled=?, toml_order=?, fault_count=?, prev_command=?, updated_at=?
+                       WHERE name=?''',
+                    (
+                        item['interval'], item['command'], item['timeout'], item['skill'], env_json,
+                        item['fault_threshold'], enabled_int, item['toml_order'], fault_count,
+                        item['command_identity'], now_iso, name,
+                    ),
+                )
+            else:
+                connection.execute(
+                    '''INSERT INTO checks(
+                           name, interval, command, timeout, skill, env, fault_threshold, enabled,
+                           toml_order, last_started, last_actual_started_at, last_outcome,
+                           fault_count, prev_command, updated_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?)''',
+                    (
+                        name, item['interval'], item['command'], item['timeout'], item['skill'], env_json,
+                        item['fault_threshold'], enabled_int, item['toml_order'], item['command_identity'], now_iso,
+                    ),
+                )
+        for name in existing:
+            if name not in seen:
+                connection.execute(
+                    'UPDATE checks SET enabled=0, fault_count=0, updated_at=? WHERE name=?',
+                    (now_iso, name),
+                )
+
+
+def check_grace_seconds(interval):
+    """proofs/CheckRunner.lean の grace(interval) = min(30, floor(interval / 10)) と一致する整数秒 grace を返す。"""
+    return float(min(30, max(0, math.floor(float(interval) / 10.0))))
+
+
+def check_due_info(row, tick_started_ts):
+    """due 判定と優先群・巻き戻りフラグを返す: (is_due, priority_group, clock_anomaly, ls_ts, la_ts)。
+    整数秒の時刻・interval に対して proofs/CheckRunner.lean の isDue / isClockAnomaly / dueBase と一致させる。"""
+    last_started = row['last_started']
+    last_actual = row['last_actual_started_at']
+    last_outcome = row['last_outcome']
+    ls_ts = _parse_iso_ts(last_started) if last_started is not None else None
+    la_ts = _parse_iso_ts(last_actual) if last_actual is not None else None
+
+    if ls_ts is None or la_ts is None or last_outcome is None:
+        return True, 0, False, ls_ts, la_ts
+
+    if ls_ts > tick_started_ts or la_ts > tick_started_ts:
+        return True, 1, True, ls_ts, la_ts
+
+    base_ts = ls_ts if last_outcome in CHECK_SUCCESS_OUTCOMES else la_ts
+    grace = check_grace_seconds(row['interval'])
+    due = tick_started_ts >= base_ts + float(row['interval']) - grace
+    return due, 2, False, ls_ts, la_ts
+
+
+def select_due_checks(db_path, checks_cfg, tick_started_ts):
+    """有効な check のうち tick_started_ts 時点で due なものを規定の実行順に並べて返す。"""
+    cfg_by_name = {item['name']: item for item in checks_cfg}
+    with _check_db(db_path) as connection:
+        rows = [dict(row) for row in connection.execute('SELECT * FROM checks WHERE enabled=1')]
+
+    due_entries = []
+    for row in rows:
+        cfg = cfg_by_name.get(row['name'])
+        if cfg is None or not cfg['enabled']:
+            continue
+        is_due, group, anomaly, ls_ts, la_ts = check_due_info(row, tick_started_ts)
+        if not is_due:
+            continue
+        ls_key = (0, 0.0) if ls_ts is None else (1, ls_ts)
+        la_key = (0, 0.0) if la_ts is None else (1, la_ts)
+        due_entries.append((
+            (group, ls_key, la_key, int(row['toml_order'])),
+            {
+                **cfg,
+                'clock_anomaly': anomaly,
+                'last_started': row['last_started'],
+                'last_actual_started_at': row['last_actual_started_at'],
+                'last_outcome': row['last_outcome'],
+                'fault_count': row['fault_count'],
+            },
+        ))
+    due_entries.sort(key=lambda pair: pair[0])
+    return [entry for _, entry in due_entries]
+
+
+def parse_check_jsonl(raw_stdout):
+    """stdout バイト列を DB 書き込み前に全行まとめて検証する。
+    違反があれば (False, None)、正常なら (True, [(dedup_key, title, body), ...]) を返す。"""
+    if len(raw_stdout) > CHECK_STDOUT_LIMIT:
+        return False, None
+    try:
+        decoded = raw_stdout.decode('utf-8')
+    except UnicodeDecodeError:
+        return False, None
+
+    def _reject_constant(_value):
+        raise ValueError('invalid JSON constant')
+
+    events = []
+    seen_keys = set()
+    for raw_line in decoded.split('\n'):
+        line = raw_line.rstrip('\r')
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            return False, None
+        if type(obj) is not dict:
+            return False, None
+        if 'title' not in obj or 'body' not in obj:
+            return False, None
+        title = obj['title']
+        body = obj['body']
+        if type(title) is not str or not (1 <= len(title) <= 200) or '\x00' in title or _has_surrogate(title):
+            return False, None
+        if type(body) is not str or _has_surrogate(body):
+            return False, None
+        if 'key' in obj:
+            key = obj['key']
+            if type(key) is not str or not key or not CHECK_KEY_RE.fullmatch(key):
+                return False, None
+            dedup_key = key
+        else:
+            dedup_key = ''
+        if dedup_key in seen_keys:
+            return False, None
+        seen_keys.add(dedup_key)
+        events.append((dedup_key, title, body))
+    return True, events
+
+
+def _drain_pipe(stream, limit, state):
+    total = 0
+    try:
+        while True:
+            data = stream.read(4096)
+            if not data:
+                state['eof'] = True
+                break
+            if total < limit:
+                take = data[:limit - total]
+                state['chunks'].append(take)
+                total += len(take)
+    except OSError:
+        state['error'] = True
+    finally:
+        with suppress(OSError):
+            stream.close()
+
+
+def run_check_command(
+    chk, config_dir, tick_deadline, *,
+    mono_fn=time.monotonic, kill_grace=CHECK_KILL_GRACE_SEC,
+    cleanup_deadline=None, launch_state=None,
+):
+    """1 check の command を独立プロセスグループで実行し、(exit_code, raw_stdout, raw_stderr, timed_out, aborted) を返す。
+
+    Policy:
+    - wait_until = min(cmd_mono_start + timeout, tick_deadline) をプロセス終了と stdout/stderr の EOF 回収の両方に適用する。
+    - wait_until 以降に観測された正常終了 (wait_budget == 0.0 で既に終了していた子を TimeoutExpired なしで回収した場合を含む) は
+      TimeoutExpired と同一の deadline miss として分類し (command timeout が支配的なら failed_timeout、そうでなければ aborted)、
+      exit code を捨てる。
+    - helper が stdout/stderr を開いたまま等で EOF 回収が wait_until 内に完了しない場合も、不完全な出力を parse せず
+      プロセスグループを終了させ deadline miss (または失敗) として記録する。
+    - cleanup_deadline が指定されている場合、SIGTERM 猶予・SIGKILL 後の回収待ち・drain thread join の合計を
+      cleanup_deadline 内に収め、後続の commit 予約予算を圧迫しない。
+    - KeyboardInterrupt 等の割り込み時は、tick lock 解放前にプロセスグループを上限付きで終了・回収してから再送出する。
+    """
+    cmd_env = {**os.environ, **chk['env']}
+    cmd_mono_start = mono_fn()
+    if cmd_mono_start >= tick_deadline:
+        if launch_state is not None:
+            launch_state['refused'] = True
+        return None, b'', b'', False, True
+    timeout_at = cmd_mono_start + chk['timeout']
+    wait_until = min(timeout_at, tick_deadline)
+
+    def _classify_deadline_miss():
+        # 先に到来した (支配的な) deadline で分類する。
+        # 同時 (timeout_at == tick_deadline) は優先順位 failed_timeout > aborted に従い failed_timeout。
+        if timeout_at <= tick_deadline:
+            return True, False
+        return False, True
+
+    out_state = {'chunks': [], 'eof': False, 'error': False}
+    err_state = {'chunks': [], 'eof': False, 'error': False}
+    out_thread = None
+    err_thread = None
+    timed_out = False
+    aborted = False
+    capture_incomplete = False
+    try:
+        process = subprocess.Popen(
+            chk['argv'],
+            cwd=str(config_dir),
+            env=cmd_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as error:
+        return None, b'', str(error).encode('utf-8', errors='replace'), False, False
+
+    def _cleanup_group():
+        _terminate_process_group(
+            process,
+            kill_grace,
+            kill_wait_sec=CHECK_KILL_WAIT_SEC,
+            deadline=cleanup_deadline,
+            tail_reserve_sec=0.0 if cleanup_deadline is None else CHECK_DRAIN_JOIN_SEC,
+            mono_fn=mono_fn,
+        )
+
+    try:
+        out_thread = threading.Thread(target=_drain_pipe, args=(process.stdout, CHECK_STDOUT_LIMIT + 1, out_state), daemon=True)
+        err_thread = threading.Thread(target=_drain_pipe, args=(process.stderr, CHECK_STDERR_LIMIT, err_state), daemon=True)
+        out_thread.start()
+        err_thread.start()
+
+        wait_budget = max(0.0, wait_until - mono_fn())
+        try:
+            process.wait(timeout=wait_budget)
+        except subprocess.TimeoutExpired:
+            timed_out, aborted = _classify_deadline_miss()
+            _cleanup_group()
+        else:
+            now_m = mono_fn()
+            if now_m >= wait_until:
+                # wait_until 以降に観測された完了は TimeoutExpired と同じく deadline miss とし exit code を捨てる
+                timed_out, aborted = _classify_deadline_miss()
+                _cleanup_group()
+            else:
+                # stdout / stderr の EOF 回収にも同じ wait_until を適用する
+                for thread in (out_thread, err_thread):
+                    pipe_rem = max(0.0, wait_until - mono_fn())
+                    thread.join(timeout=pipe_rem)
+                    if thread.is_alive():
+                        break
+                now_m = mono_fn()
+                if out_thread.is_alive() or err_thread.is_alive():
+                    # pipe が deadline までに EOF へ到達しなかった: グループを停止し不完全出力を parse させない
+                    timed_out, aborted = _classify_deadline_miss()
+                    _cleanup_group()
+                elif not out_state['eof'] or not err_state['eof']:
+                    # EOF に到達しない読み取り異常: 空出力を ok_silent と誤認させない
+                    capture_incomplete = True
+                    _cleanup_group()
+                elif now_m >= wait_until:
+                    timed_out, aborted = _classify_deadline_miss()
+                    _cleanup_group()
+
+        # グループ停止後の drain thread 終了を上限付きで待ち、抜粋を可能な限り回収する
+        if cleanup_deadline is None:
+            drain_real_deadline = time.monotonic() + CHECK_DRAIN_JOIN_SEC
+            for thread in (out_thread, err_thread):
+                if thread.is_alive():
+                    thread.join(timeout=max(0.0, drain_real_deadline - time.monotonic()))
+        else:
+            drain_mono_start = mono_fn()
+            drain_mono_deadline = min(drain_mono_start + CHECK_DRAIN_JOIN_SEC, cleanup_deadline)
+            drain_real_deadline = time.monotonic() + max(0.0, drain_mono_deadline - drain_mono_start)
+            for thread in (out_thread, err_thread):
+                if thread.is_alive():
+                    rem_t = min(
+                        max(0.0, drain_mono_deadline - mono_fn()),
+                        max(0.0, drain_real_deadline - time.monotonic()),
+                    )
+                    if rem_t <= 0:
+                        break
+                    thread.join(timeout=rem_t)
+    except BaseException:
+        _terminate_process_group(process, min(kill_grace, CHECK_INTERRUPT_KILL_GRACE_SEC))
+        for thread, stream in ((out_thread, process.stdout), (err_thread, process.stderr)):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=CHECK_DRAIN_JOIN_SEC)
+            if (thread is None or thread.ident is None) and stream is not None:
+                with suppress(OSError, ValueError):
+                    stream.close()
+        raise
+
+    raw_stdout = b''.join(list(out_state['chunks']))
+    raw_stderr = b''.join(list(err_state['chunks']))
+    exit_code = None if (timed_out or aborted or capture_incomplete) else process.returncode
+    return exit_code, raw_stdout, raw_stderr, timed_out, aborted
+
+
+def _is_sqlite_retryable_contention(error):
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    errcode = getattr(error, 'sqlite_errorcode', None)
+    if errcode is not None and (errcode & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return True
+    msg = str(error).lower()
+    return 'locked' in msg or 'busy' in msg
+
+
+def commit_check_run(
+    db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
+    *, exit_code, raw_stdout, raw_stderr, timed_out, aborted,
+    busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+):
+    """1 回の check 実行結果を 1 つの BEGIN IMMEDIATE トランザクションで確定する。
+    aborted の場合は check_runs の INSERT のみを行い、checks の実行状態カラムは一切更新しない。"""
+    stdout_excerpt = _excerpt_4k(raw_stdout)
+    stderr_excerpt = _excerpt_4k(raw_stderr)
+    clock_anomaly_int = 1 if chk['clock_anomaly'] else 0
+
+    # outcome 優先順位: failed_timeout > aborted > failed_exit > failed_output > 正常系
+    events = None
+    if timed_out:
+        pre_outcome = 'failed_timeout'
+    elif aborted:
+        pre_outcome = 'aborted'
+    elif exit_code != 0:
+        pre_outcome = 'failed_exit'
+    else:
+        valid, events = parse_check_jsonl(raw_stdout)
+        pre_outcome = None if valid else 'failed_output'
+
+    with _check_db(db_path, busy_timeout_ms=busy_timeout_ms) as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        if pre_outcome == 'aborted':
+            cursor = connection.execute(
+                '''INSERT INTO check_runs(
+                       tick_id, check_name, started_at, finished_at, exit_code, outcome,
+                       stdout_excerpt, stderr_excerpt, events_deferred, clock_anomaly)
+                   VALUES(?, ?, ?, ?, NULL, 'aborted', ?, ?, 0, ?)''',
+                (tick_id, chk['name'], actual_started_iso, finished_iso, stdout_excerpt, stderr_excerpt, clock_anomaly_int),
+            )
+            return {'run_id': cursor.lastrowid, 'outcome': 'aborted', 'events_deferred': 0, 'created_task_ids': []}
+
+        created_task_ids = []
+        run_events = []
+        events_deferred = 0
+
+        if pre_outcome is None:
+            fired_count = 0
+            suppressed_count = 0
+            for dedup_key, title, body in events:
+                existing_row = connection.execute(
+                    '''SELECT ct.task_id
+                       FROM check_tasks ct
+                       JOIN tasks t ON t.id = ct.task_id
+                       WHERE ct.check_name=? AND ct.kind='event' AND ct.dedup_key=? AND t.lane != 'done'
+                       ORDER BY ct.created_at ASC, ct.task_id ASC
+                       LIMIT 1''',
+                    (chk['name'], dedup_key),
+                ).fetchone()
+                if existing_row is not None:
+                    suppressed_count += 1
+                    run_events.append((dedup_key, 'suppressed', None, existing_row['task_id']))
+                elif fired_count < CHECK_EVENT_CAP:
+                    task_id = uuid.uuid4().hex
+                    safe_request = body.replace('\x00', '')[:TASK_LIMITS['request']]
+                    done_when = f"skill:{chk['skill']} の手順で対応し完了する"[:TASK_LIMITS['done_when']]
+                    connection.execute(
+                        '''INSERT INTO tasks(id, title, request, pane, run, result, remaining, lane, decision_id, created_at, updated_at, machine, kind, done_when)
+                           VALUES(?, ?, ?, '', '', '', '', 'todo', NULL, ?, ?, '', 'monitor', ?)''',
+                        (task_id, title, safe_request, finished_iso, finished_iso, done_when),
+                    )
+                    connection.execute(
+                        '''INSERT INTO check_tasks(task_id, check_name, kind, dedup_key, skill, needs_wake, notified_at, last_wake_attempt_at, created_at)
+                           VALUES(?, ?, 'event', ?, ?, 1, NULL, NULL, ?)''',
+                        (task_id, chk['name'], dedup_key, chk['skill'], finished_iso),
+                    )
+                    fired_count += 1
+                    created_task_ids.append(task_id)
+                    run_events.append((dedup_key, 'fired', task_id, None))
+                else:
+                    events_deferred += 1
+
+            if fired_count > 0 and suppressed_count > 0:
+                outcome = 'mixed'
+            elif fired_count > 0:
+                outcome = 'fired'
+            elif suppressed_count > 0:
+                outcome = 'suppressed'
+            else:
+                outcome = 'ok_silent'
+            new_fault_count = 0
+        else:
+            outcome = pre_outcome
+            open_fault = connection.execute(
+                '''SELECT ct.task_id
+                   FROM check_tasks ct
+                   JOIN tasks t ON t.id = ct.task_id
+                   WHERE ct.check_name=? AND ct.kind='fault' AND ct.dedup_key='' AND t.lane != 'done'
+                   LIMIT 1''',
+                (chk['name'],),
+            ).fetchone()
+            if open_fault is not None:
+                # 未完了の故障タスクが存在する間は fault_count を進めない (0 のまま維持する)
+                new_fault_count = 0
+            else:
+                cur_row = connection.execute('SELECT fault_count, fault_threshold FROM checks WHERE name=?', (chk['name'],)).fetchone()
+                cur_fc = cur_row['fault_count'] if cur_row is not None else 0
+                threshold = cur_row['fault_threshold'] if cur_row is not None else chk['fault_threshold']
+                next_fc = cur_fc + 1
+                if next_fc >= threshold:
+                    task_id = uuid.uuid4().hex
+                    fault_title = f"[check-fault] {chk['name']} ({outcome})"[:TASK_LIMITS['title']]
+                    fault_body = f"check={chk['name']} outcome={outcome} exit_code={exit_code}\n{stderr_excerpt}".strip()[:TASK_LIMITS['request']]
+                    done_when = f"skill:{CHECK_FAULT_SKILL} の手順で {chk['name']} の故障を解消する"[:TASK_LIMITS['done_when']]
+                    connection.execute(
+                        '''INSERT INTO tasks(id, title, request, pane, run, result, remaining, lane, decision_id, created_at, updated_at, machine, kind, done_when)
+                           VALUES(?, ?, ?, '', '', '', '', 'todo', NULL, ?, ?, '', 'monitor', ?)''',
+                        (task_id, fault_title, fault_body, finished_iso, finished_iso, done_when),
+                    )
+                    connection.execute(
+                        '''INSERT INTO check_tasks(task_id, check_name, kind, dedup_key, skill, needs_wake, notified_at, last_wake_attempt_at, created_at)
+                           VALUES(?, ?, 'fault', '', ?, 1, NULL, NULL, ?)''',
+                        (task_id, chk['name'], CHECK_FAULT_SKILL, finished_iso),
+                    )
+                    created_task_ids.append(task_id)
+                    new_fault_count = 0
+                else:
+                    new_fault_count = next_fc
+
+        cursor = connection.execute(
+            '''INSERT INTO check_runs(
+                   tick_id, check_name, started_at, finished_at, exit_code, outcome,
+                   stdout_excerpt, stderr_excerpt, events_deferred, clock_anomaly)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (tick_id, chk['name'], actual_started_iso, finished_iso, exit_code, outcome, stdout_excerpt, stderr_excerpt, events_deferred, clock_anomaly_int),
+        )
+        run_id = cursor.lastrowid
+        if run_events:
+            connection.executemany(
+                'INSERT INTO check_run_events(run_id, dedup_key, outcome, task_id, suppressed_by_task_id) VALUES(?, ?, ?, ?, ?)',
+                [(run_id, dk, ev_out, tid, sup_id) for dk, ev_out, tid, sup_id in run_events],
+            )
+        connection.execute(
+            '''UPDATE checks
+               SET last_started=?, last_actual_started_at=?, last_outcome=?, fault_count=?, updated_at=?
+               WHERE name=?''',
+            (tick_started_iso, actual_started_iso, outcome, new_fault_count, finished_iso, chk['name']),
+        )
+        return {'run_id': run_id, 'outcome': outcome, 'events_deferred': events_deferred, 'created_task_ids': created_task_ids}
+
+
+def _deliver_wake_run_inbox(candidate, *, run_inbox_bin, run_id_box, timeout, mono_fn):
+    """窓口の run-inbox へ 1 件投入する (本文に非信頼テキストは混ぜない)。"""
+    deadline = mono_fn() + timeout
+    target_run = run_id_box[0]
+    if not target_run:
+        rem = deadline - mono_fn()
+        if rem <= 0:
+            return False, 'active timeout'
+        rc, out, err, timed_out = _run_subprocess_bounded([run_inbox_bin, 'active'], timeout=rem, kill_grace=0.2)
+        if timed_out or rc != 0:
+            return False, f"run-inbox active failed (rc={rc}): {err.decode('utf-8', errors='replace').strip()}"
+        resolved = out.decode('utf-8', errors='replace').strip().splitlines()
+        if not resolved or not resolved[0].strip():
+            return False, 'run-inbox active returned empty run id'
+        target_run = resolved[0].strip()
+        run_id_box[0] = target_run
+
+    rem = deadline - mono_fn()
+    if rem <= 0:
+        return False, 'send timeout'
+    # 非信頼データ (title / body) は載せず、返信不要タグ [info] と静的メタデータのみ送る
+    message = f"[info] check={candidate['check_name']} kind={candidate['kind']} task_id={candidate['task_id']} skill={candidate['skill']}"
+    rc, _out, err, timed_out = _run_subprocess_bounded(
+        [run_inbox_bin, 'send', '--run', target_run, '--req', candidate['task_id'], message],
+        timeout=rem,
+        kill_grace=0.2,
+    )
+    if timed_out or rc != 0:
+        return False, f"run-inbox send failed (rc={rc}): {err.decode('utf-8', errors='replace').strip()}"
+    return True, ''
+
+
+def run_wake_pass(
+    db_path, *, now_iso_fn, mono_fn=time.monotonic,
+    run_inbox_bin=None, wake_run_id=None, skip_task_ids=None,
+    pass_budget=CHECK_WAKE_PASS_BUDGET_SEC, item_timeout=CHECK_WAKE_ITEM_TIMEOUT_SEC,
+    cb_limit=CHECK_WAKE_CB_LIMIT, deliver_fn=None,
+    busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+    stop_on_db_contention=False,
+    failed_ids_out=None,
+):
+    """1 回の wake パスを実行する。
+    (1) I/O ループ前に回収 (claim 済み・終了済みの needs_wake=0) を無条件に一括 UPDATE。
+    (2) トランザクション外で run-inbox 投入 (1 件 5 秒、パス合計 20 秒、2 件連続失敗で CB)。
+    戻り値: (failed_task_ids: set[str], truncated_by_budget: bool, attempted_count: int)。"""
+    pass_budget_pos = max(0.0, float(pass_budget))
+    pass_deadline = mono_fn() + pass_budget_pos
+    pass_real_deadline = time.monotonic() + pass_budget_pos
+    skip = set(skip_task_ids or ())
+
+    def _wake_db_busy_ms():
+        rem = min(pass_deadline - mono_fn(), pass_real_deadline - time.monotonic())
+        if rem <= 0:
+            return 0
+        return min(max(0, int(busy_timeout_ms)), int(rem * 1000))
+
+    # 回収 (wake I/O ループの前に無条件で実行。notified_at は NULL のまま維持)
+    try:
+        with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute(
+                '''UPDATE check_tasks
+                   SET needs_wake = 0
+                   WHERE needs_wake = 1
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks
+                         WHERE tasks.id = check_tasks.task_id
+                           AND tasks.lane = 'todo'
+                           AND tasks.pane = ''
+                           AND tasks.run = ''
+                     )'''
+            )
+
+        # 候補取得 (I/O 中はトランザクションを保持しない)
+        with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
+            candidates = [
+                dict(row)
+                for row in connection.execute(
+                    '''SELECT ct.task_id, ct.check_name, ct.kind, ct.dedup_key, ct.skill,
+                              ct.created_at, ct.last_wake_attempt_at
+                       FROM check_tasks ct
+                       JOIN tasks t ON t.id = ct.task_id
+                       WHERE ct.needs_wake = 1
+                         AND t.lane = 'todo'
+                         AND t.pane = ''
+                         AND t.run = ''
+                       ORDER BY COALESCE(ct.last_wake_attempt_at, ct.created_at) ASC,
+                                CASE WHEN ct.kind = 'fault' THEN 0 ELSE 1 END ASC,
+                                ct.task_id ASC'''
+                )
+            ]
+    except sqlite3.Error as db_error:
+        if stop_on_db_contention and _is_sqlite_retryable_contention(db_error):
+            return set(), True, 0
+        raise
+
+    candidates = [item for item in candidates if item['task_id'] not in skip]
+    failed_ids = set()
+    truncated = False
+    consecutive_failures = 0
+    attempted = 0
+    run_id_box = [wake_run_id or os.environ.get('CUE_WAKE_RUN_ID') or None]
+    inbox_bin = run_inbox_bin or default_run_inbox_bin()
+
+    for candidate in candidates:
+        remaining = pass_deadline - mono_fn()
+        if remaining < item_timeout:
+            truncated = True
+            break
+        attempted += 1
+        attempt_iso = now_iso_fn()
+        if deliver_fn is not None:
+            ok = bool(deliver_fn(candidate, item_timeout))
+        else:
+            ok, _reason = _deliver_wake_run_inbox(
+                candidate, run_inbox_bin=inbox_bin, run_id_box=run_id_box, timeout=item_timeout, mono_fn=mono_fn,
+            )
+        if ok:
+            consecutive_failures = 0
+        else:
+            failed_ids.add(candidate['task_id'])
+            if failed_ids_out is not None:
+                failed_ids_out.add(candidate['task_id'])
+            consecutive_failures += 1
+        try:
+            with _check_db(db_path, busy_timeout_ms=_wake_db_busy_ms()) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                if ok:
+                    connection.execute(
+                        'UPDATE check_tasks SET needs_wake=0, notified_at=?, last_wake_attempt_at=? WHERE task_id=?',
+                        (attempt_iso, attempt_iso, candidate['task_id']),
+                    )
+                else:
+                    connection.execute(
+                        'UPDATE check_tasks SET last_wake_attempt_at=? WHERE task_id=?',
+                        (attempt_iso, candidate['task_id']),
+                    )
+        except sqlite3.Error as db_error:
+            if stop_on_db_contention and _is_sqlite_retryable_contention(db_error):
+                return failed_ids, True, attempted
+            raise
+        if consecutive_failures >= cb_limit:
+            break
+
+    return failed_ids, truncated, attempted
+
+
+def _commit_check_run_with_retry(
+    db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
+    *, exit_code, raw_stdout, raw_stderr, timed_out, aborted,
+    retry_deadline, mono_fn, busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+):
+    """SQLite の一時的な書き込み競合 (locked / busy) に対し、command を再実行せず残り budget 内で commit を再試行する。
+    rem <= 0 では commit を試行しない (初回を含む)。各試行の busy timeout は残り時間で clamp する。
+    初回時点で既に rem <= 0 の場合は commit を呼ばず、期限超過を表す sqlite3.OperationalError を送出する。"""
+    retry_mono_start = mono_fn()
+    retry_budget = max(0.0, retry_deadline - retry_mono_start)
+    retry_real_deadline = time.monotonic() + retry_budget
+    last_error = None
+    while True:
+        mono_rem = retry_deadline - mono_fn()
+        real_rem = retry_real_deadline - time.monotonic()
+        rem = min(mono_rem, real_rem)
+        if rem <= 0:
+            if last_error is not None:
+                raise last_error
+            raise sqlite3.OperationalError(
+                'commit retry deadline exceeded before the first attempt'
+            )
+        attempt_busy_ms = min(max(0, int(busy_timeout_ms)), max(0, int(rem * 1000))) if rem > 0 else 0
+        try:
+            return commit_check_run(
+                db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_iso,
+                exit_code=exit_code, raw_stdout=raw_stdout, raw_stderr=raw_stderr,
+                timed_out=timed_out, aborted=aborted,
+                busy_timeout_ms=attempt_busy_ms,
+            )
+        except sqlite3.Error as db_error:
+            if not _is_sqlite_retryable_contention(db_error):
+                raise
+            last_error = db_error
+            mono_rem = retry_deadline - mono_fn()
+            real_rem = retry_real_deadline - time.monotonic()
+            rem = min(mono_rem, real_rem)
+            if rem <= 0 or int(rem * 1000) <= 0:
+                raise
+            time.sleep(min(0.05, rem / 2.0))
+            mono_rem = retry_deadline - mono_fn()
+            real_rem = retry_real_deadline - time.monotonic()
+            if min(mono_rem, real_rem) <= 0:
+                raise
+
+
+def prune_check_history(
+    db_path, current_tick_id, cutoff_iso, *,
+    batch_size=CHECK_PRUNE_BATCH, deadline=None, mono_fn=time.monotonic,
+    busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+):
+    """30 日を超えた check_runs / check_run_events / check_ticks を小さいバッチに分けて削除する。
+    deadline が指定されている場合は残り budget 内のバッチのみ実行し、DB 待ちも残り budget 内に抑え、
+    保持される run を持つ親 tick は削除しない。"""
+    real_deadline = None
+    first_mono = None
+    if deadline is not None:
+        first_mono = mono_fn()
+        real_deadline = time.monotonic() + max(0.0, deadline - first_mono)
+
+    def _batch_busy_ms():
+        nonlocal first_mono
+        if deadline is None:
+            return max(0, int(busy_timeout_ms))
+        if first_mono is not None:
+            now_m = first_mono
+            first_mono = None
+        else:
+            now_m = mono_fn()
+        rem = min(deadline - now_m, real_deadline - time.monotonic())
+        if rem <= 0:
+            return None
+        return min(max(0, int(busy_timeout_ms)), int(rem * 1000))
+
+    while True:
+        batch_busy_ms = _batch_busy_ms()
+        if batch_busy_ms is None:
+            return False
+        try:
+            with _check_db(db_path, busy_timeout_ms=batch_busy_ms) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                run_ids = [
+                    row['id']
+                    for row in connection.execute(
+                        'SELECT id FROM check_runs WHERE started_at < ? ORDER BY id LIMIT ?',
+                        (cutoff_iso, batch_size),
+                    )
+                ]
+                if not run_ids:
+                    break
+                marks = ','.join('?' * len(run_ids))
+                connection.execute(f'DELETE FROM check_run_events WHERE run_id IN ({marks})', run_ids)
+                connection.execute(f'DELETE FROM check_runs WHERE id IN ({marks})', run_ids)
+        except sqlite3.Error as db_error:
+            if deadline is not None and _is_sqlite_retryable_contention(db_error):
+                return False
+            raise
+
+    while True:
+        batch_busy_ms = _batch_busy_ms()
+        if batch_busy_ms is None:
+            return False
+        try:
+            with _check_db(db_path, busy_timeout_ms=batch_busy_ms) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                tick_ids = [
+                    row['id']
+                    for row in connection.execute(
+                        '''SELECT id FROM check_ticks
+                           WHERE started_at < ?
+                             AND id != ?
+                             AND NOT EXISTS (SELECT 1 FROM check_runs WHERE check_runs.tick_id = check_ticks.id)
+                           ORDER BY id LIMIT ?''',
+                        (cutoff_iso, current_tick_id, batch_size),
+                    )
+                ]
+                if not tick_ids:
+                    break
+                marks = ','.join('?' * len(tick_ids))
+                connection.execute(f'DELETE FROM check_ticks WHERE id IN ({marks})', tick_ids)
+        except sqlite3.Error as db_error:
+            if deadline is not None and _is_sqlite_retryable_contention(db_error):
+                return False
+            raise
+    return True
+
+
+def run_check_tick(
+    db_path, config_path, *,
+    run_inbox_bin=None, wake_run_id=None,
+    now_fn=None, mono_fn=time.monotonic,
+    tick_budget=CHECK_TICK_BUDGET_SEC,
+    wake_pass_budget=CHECK_WAKE_PASS_BUDGET_SEC,
+    wake_item_timeout=CHECK_WAKE_ITEM_TIMEOUT_SEC,
+    kill_grace=CHECK_KILL_GRACE_SEC,
+    finalize_reserve=None,
+    commit_reserve=None,
+    commit_busy_timeout_ms=CHECK_COMMIT_BUSY_TIMEOUT_MS,
+    deliver_fn=None,
+):
+    """app.py check tick の本体。設計書 (issue-701-v9) の処理順 (1)〜(9) を厳密に実行する。"""
+    db_path = _resolve_check_db_path(db_path)
+    if tick_budget is None:
+        tick_budget = CHECK_TICK_BUDGET_SEC
+    if wake_pass_budget is None:
+        wake_pass_budget = CHECK_WAKE_PASS_BUDGET_SEC
+    if wake_item_timeout is None:
+        wake_item_timeout = CHECK_WAKE_ITEM_TIMEOUT_SEC
+    if kill_grace is None:
+        kill_grace = CHECK_KILL_GRACE_SEC
+
+    mono_start = mono_fn()
+    tick_deadline = mono_start + tick_budget
+    env_now = _parse_check_now_env() if now_fn is None else None
+    if now_fn is not None:
+        tick_started_ts = float(now_fn())
+        wall_now_fn = lambda: float(now_fn())
+    elif env_now is not None:
+        tick_started_ts = env_now
+        wall_now_fn = lambda: tick_started_ts + max(0.0, mono_fn() - mono_start)
+    else:
+        tick_started_ts = time.time()
+        wall_now_fn = time.time
+    tick_started_iso = _iso_utc(tick_started_ts)
+    now_iso_fn = lambda: _iso_utc(wall_now_fn())
+
+    # (1) flock 取得 (DB と同じ永続ディレクトリの固定 lockfile。終了時に unlink しない)
+    lock_file = check_lock_path(db_path)
+    lock_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise
+            # ロック不取得: WAL 切替・DDL を行わず最小の skip 記録だけ行う
+            skip_id = _record_skipped_tick(db_path, tick_started_iso)
+            return {
+                'tick_id': skip_id, 'status': 'skipped', 'started_at': tick_started_iso,
+                'finished_at': tick_started_iso, 'wake_failed': 0, 'unnotified_tasks': 0,
+                'checks_deferred': None,
+            }, 0
+
+        # (1) と (2) の間: WAL 切替と additive テーブル作成はここでのみ行う
+        ensure_check_schema(db_path)
+
+        # (2) check_ticks に status='running' で INSERT
+        with _check_db(db_path) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            cursor = connection.execute(
+                "INSERT INTO check_ticks(started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred) VALUES(?, NULL, 'running', 0, 0, NULL)",
+                (tick_started_iso,),
+            )
+            tick_id = cursor.lastrowid
+
+        all_failed = set()
+        any_wake_truncated = False
+
+        def _finalize_tick(status, exit_code, checks_deferred_val, *, error_msg=None, end_wake_skipped=False):
+            nonlocal any_wake_truncated
+            finished_iso = now_iso_fn()
+            finalize_rem = tick_deadline - mono_fn()
+            finalize_busy_ms = min(CHECK_COMMIT_BUSY_TIMEOUT_MS, max(0, int(finalize_rem * 1000)))
+            unnotified = None
+            result_status = status
+            result_exit_code = exit_code
+            result_error = error_msg
+            try:
+                with _check_db(db_path, busy_timeout_ms=finalize_busy_ms) as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    unnotified = connection.execute('SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1').fetchone()[0]
+                    connection.execute(
+                        'UPDATE check_ticks SET finished_at=?, status=?, wake_failed=?, unnotified_tasks=?, checks_deferred=? WHERE id=?',
+                        (finished_iso, status, len(all_failed), unnotified, checks_deferred_val, tick_id),
+                    )
+            except sqlite3.Error as db_error:
+                print(f'error: failed to finalize check tick {tick_id}: {db_error}', file=sys.stderr)
+                if result_status != 'config_error':
+                    result_status = 'failed'
+                    result_exit_code = 1
+                if result_error is None:
+                    result_error = str(db_error)
+
+            if end_wake_skipped and (unnotified is None or unnotified > 0):
+                any_wake_truncated = True
+
+            if all_failed or any_wake_truncated:
+                print(
+                    f'warning: check tick wake issue (wake_failed={len(all_failed)}, truncated={any_wake_truncated}, unnotified={unnotified})',
+                    file=sys.stderr,
+                )
+
+            result_body = {
+                'tick_id': tick_id, 'status': result_status, 'started_at': tick_started_iso,
+                'finished_at': finished_iso, 'wake_failed': len(all_failed),
+                'unnotified_tasks': unnotified, 'checks_deferred': checks_deferred_val,
+            }
+            if result_error is not None:
+                result_body['error'] = result_error
+            return result_body, result_exit_code
+
+        # (3) tick 開始時 wake (config 検査より前に行う)
+        try:
+            start_failed, start_truncated, _ = run_wake_pass(
+                db_path, now_iso_fn=now_iso_fn, mono_fn=mono_fn,
+                run_inbox_bin=run_inbox_bin, wake_run_id=wake_run_id,
+                pass_budget=wake_pass_budget, item_timeout=wake_item_timeout,
+                deliver_fn=deliver_fn,
+                busy_timeout_ms=commit_busy_timeout_ms,
+                failed_ids_out=all_failed,
+            )
+        except sqlite3.Error as db_error:
+            any_wake_truncated = True
+            print(f'error: failed during start wake pass for check tick {tick_id}: {db_error}', file=sys.stderr)
+            return _finalize_tick('failed', 1, None, error_msg=str(db_error))
+        all_failed |= start_failed
+        any_wake_truncated = start_truncated
+
+        # (4) checkout 検査と TOML 読込・検証
+        try:
+            if not config_path:
+                raise CheckConfigError('--config または CUE_CHECKS_CONFIG を指定してください')
+            _checkout_root, config_dir, checks_cfg = load_and_validate_checks_config(config_path, mono_fn=mono_fn)
+        except CheckConfigError as error:
+            # config_error: (5)〜(8) を飛ばし、(9) は必ず実行
+            print(f'error: check tick config_error: {error}', file=sys.stderr)
+            return _finalize_tick('config_error', 1, None, error_msg=str(error))
+
+        effective_reserve = (
+            min(CHECK_FINALIZE_RESERVE_SEC, max(0.0, float(tick_budget) * 0.1))
+            if finalize_reserve is None
+            else max(0.0, float(finalize_reserve))
+        )
+        end_work_deadline = tick_deadline - effective_reserve
+
+        # (5) checks テーブルの鏡同期 (DB 待ち時間は end_work_deadline までの残り作業時間で上限する)
+        mirror_rem = end_work_deadline - mono_fn()
+        if mirror_rem <= 0:
+            return _finalize_tick('aborted', 0, None)
+        mirror_busy_ms = min(max(0, int(commit_busy_timeout_ms)), max(0, int(mirror_rem * 1000)))
+        try:
+            sync_checks_mirror(
+                db_path, checks_cfg, now_iso_fn(),
+                busy_timeout_ms=mirror_busy_ms,
+            )
+        except sqlite3.Error as db_error:
+            print(f'error: failed to sync checks mirror for check tick {tick_id}: {db_error}', file=sys.stderr)
+            return _finalize_tick('failed', 1, None, error_msg=str(db_error))
+
+        # (6) due な check の実行
+        due_checks = select_due_checks(db_path, checks_cfg, tick_started_ts)
+        work_budget = max(0.0, end_work_deadline - mono_start)
+        effective_commit_reserve = (
+            min(CHECK_COMMIT_RESERVE_SEC, work_budget * 0.1)
+            if commit_reserve is None
+            else max(0.0, float(commit_reserve))
+        )
+        commit_start_deadline = end_work_deadline - effective_commit_reserve
+        pre_commit_budget = max(0.0, commit_start_deadline - mono_start)
+        max_cleanup_sec = max(0.0, float(kill_grace)) + CHECK_KILL_WAIT_SEC + CHECK_DRAIN_JOIN_SEC
+        effective_cleanup_reserve = min(max_cleanup_sec, pre_commit_budget * 0.5)
+        exec_deadline = commit_start_deadline - effective_cleanup_reserve
+        checks_deferred = 0
+        tick_status = 'ok'
+        tick_exit_code = 0
+
+        if (exec_deadline - mono_fn()) <= 0:
+            # step (6) 開始時点で実行・cleanup・保存予算の残り時間 0 以下: 0 件実行、全件 checks_deferred、status=aborted
+            checks_deferred = len(due_checks)
+            tick_status = 'aborted'
+        else:
+            for idx, chk in enumerate(due_checks):
+                remaining = exec_deadline - mono_fn()
+                if idx == 0:
+                    if remaining <= 0:
+                        checks_deferred += len(due_checks) - idx
+                        tick_status = 'aborted'
+                        break
+                else:
+                    if remaining < chk['timeout']:
+                        checks_deferred += 1
+                        continue
+
+                actual_started_iso = now_iso_fn()
+                launch_state = {'refused': False}
+                exit_code, raw_stdout, raw_stderr, timed_out, aborted = run_check_command(
+                    chk, config_dir, exec_deadline,
+                    mono_fn=mono_fn, kill_grace=kill_grace,
+                    cleanup_deadline=commit_start_deadline, launch_state=launch_state,
+                )
+                if aborted and launch_state['refused']:
+                    # 起動直前ガードで未着手となった due check は step (6) 開始時・ループ前ガードと
+                    # 同一規則 (issue-701-v9) で記録せず checks_deferred に計上する。
+                    checks_deferred += len(due_checks) - idx
+                    if idx == 0:
+                        tick_status = 'aborted'
+                    break
+                finished_run_iso = now_iso_fn()
+                try:
+                    run_result = _commit_check_run_with_retry(
+                        db_path, tick_id, chk, tick_started_iso, actual_started_iso, finished_run_iso,
+                        exit_code=exit_code, raw_stdout=raw_stdout, raw_stderr=raw_stderr,
+                        timed_out=timed_out, aborted=aborted,
+                        retry_deadline=end_work_deadline, mono_fn=mono_fn,
+                        busy_timeout_ms=commit_busy_timeout_ms,
+                    )
+                except sqlite3.Error as db_error:
+                    print(f"error: failed to commit check run {chk['name']!r}: {db_error}", file=sys.stderr)
+                    checks_deferred += len(due_checks) - idx - 1
+                    tick_status = 'failed'
+                    tick_exit_code = 1
+                    break
+
+                if run_result['outcome'] == 'aborted':
+                    checks_deferred += len(due_checks) - idx - 1
+                    tick_status = 'aborted'
+                    break
+
+        # (7) tick 終了時 wake と (8) prune (step (6) が aborted / failed の場合は飛ばす。
+        # end 側の任意作業は tick の残り budget (finalize 予約を除く) 内に制限する)
+        end_wake_skipped_by_budget = False
+        if tick_status == 'ok':
+            remaining_for_end = max(0.0, end_work_deadline - mono_fn())
+            if remaining_for_end > 0:
+                end_wake_budget = min(wake_pass_budget, remaining_for_end)
+                end_failed, end_truncated, _ = run_wake_pass(
+                    db_path, now_iso_fn=now_iso_fn, mono_fn=mono_fn,
+                    run_inbox_bin=run_inbox_bin, wake_run_id=wake_run_id,
+                    skip_task_ids=start_failed,
+                    pass_budget=end_wake_budget, item_timeout=wake_item_timeout,
+                    deliver_fn=deliver_fn,
+                    busy_timeout_ms=commit_busy_timeout_ms,
+                    stop_on_db_contention=True,
+                )
+                all_failed |= end_failed
+                any_wake_truncated = any_wake_truncated or end_truncated
+            else:
+                end_wake_skipped_by_budget = True
+
+            if mono_fn() < end_work_deadline:
+                cutoff_iso = _iso_utc(tick_started_ts - CHECK_RETENTION_DAYS * 86400)
+                prune_check_history(
+                    db_path, tick_id, cutoff_iso,
+                    deadline=end_work_deadline, mono_fn=mono_fn,
+                )
+
+        # (9) check_ticks を最終 status に UPDATE (DB 待ちも公称 tick_deadline 内に制限)
+        return _finalize_tick(
+            tick_status, tick_exit_code, checks_deferred,
+            end_wake_skipped=end_wake_skipped_by_budget,
+        )
+    finally:
+        with suppress(OSError):
+            os.close(lock_fd)
+
+
+@contextmanager
+def _check_readonly_db(db_path):
+    """読み取り専用の接続。WAL 切替・DDL・DB 新規作成を行わない。"""
+    target = _resolve_check_db_path(db_path)
+    if not target.exists():
+        yield None
+        return
+    connection = sqlite3.connect(target.as_uri() + '?mode=ro', timeout=5.0, uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+    finally:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        connection.close()
+
+
+def _table_exists(connection, name):
+    return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def check_list_data(db_path):
+    with _check_readonly_db(db_path) as connection:
+        if connection is None:
+            return {'checks': []}
+        connection.execute('BEGIN')
+        if not _table_exists(connection, 'checks'):
+            return {'checks': []}
+        rows = connection.execute('SELECT * FROM checks ORDER BY enabled DESC, toml_order ASC, name ASC').fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item['enabled'] = bool(item['enabled'])
+            try:
+                item['env'] = json.loads(item['env'])
+            except (TypeError, ValueError):
+                item['env'] = {}
+            items.append(item)
+        return {'checks': items}
+
+
+def format_check_list(data):
+    checks = data['checks']
+    if not checks:
+        return '登録されている check はありません'
+    lines = []
+    for item in checks:
+        state = 'enabled' if item['enabled'] else 'disabled'
+        outcome = item['last_outcome'] or '-'
+        started = item['last_started'] or '-'
+        lines.append(
+            f"- {item['name']} [{state}] interval={item['interval']}s timeout={item['timeout']}s "
+            f"skill={item['skill']} last={outcome} ({started}) faults={item['fault_count']}/{item['fault_threshold']}"
+        )
+    return '\n'.join(lines)
+
+
+def check_status_data(db_path, *, limit=20, now_fn=None):
+    env_now = _parse_check_now_env() if now_fn is None else None
+    now_ts = float(now_fn()) if now_fn is not None else (env_now if env_now is not None else time.time())
+    cutoff_24h = _iso_utc(now_ts - 86400)
+
+    empty = {
+        'last_ok_tick_at': None,
+        'recent_ticks': [],
+        'running_leftover_count': 0,
+        'running_in_progress_count': 0,
+        'unnotified_tasks': 0,
+        'last_completed_wake_failed': None,
+        'checks_deferred_24h': {'total': 0, 'ticks': 0},
+        'events_deferred_24h': 0,
+        'max_overdue_sec': 0.0,
+        'max_overdue_check': None,
+    }
+    with _check_readonly_db(db_path) as connection:
+        if connection is None:
+            return empty
+        # 最初の table probe の前に read transaction を開始し、全クエリを単一スナップショットから読む
+        connection.execute('BEGIN')
+        if _table_exists(connection, 'check_ticks'):
+            ok_row = connection.execute(
+                "SELECT COALESCE(finished_at, started_at) AS ts FROM check_ticks WHERE status='ok' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            empty['last_ok_tick_at'] = ok_row['ts'] if ok_row else None
+
+            ticks = [
+                dict(row)
+                for row in connection.execute(
+                    'SELECT id, started_at, finished_at, status, wake_failed, unnotified_tasks, checks_deferred FROM check_ticks ORDER BY id DESC LIMIT ?',
+                    (max(1, int(limit)),),
+                )
+            ]
+            ticks.reverse()
+            empty['recent_ticks'] = ticks
+            # flock で直列化された後続の非 skipped tick が存在する場合のみ、それ以前の running 行を異常終了の残留と確定できる。
+            # 最新の非 skipped tick が running の場合は正常に実行中であり得るため異常終了と断定しない。
+            latest_holder = connection.execute(
+                "SELECT id, status FROM check_ticks WHERE status != 'skipped' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest_holder is not None:
+                empty['running_leftover_count'] = connection.execute(
+                    "SELECT COUNT(*) FROM check_ticks WHERE status='running' AND id < ?",
+                    (latest_holder['id'],),
+                ).fetchone()[0]
+                empty['running_in_progress_count'] = 1 if latest_holder['status'] == 'running' else 0
+
+            completed_row = connection.execute(
+                "SELECT wake_failed FROM check_ticks WHERE status IN ('ok', 'aborted', 'config_error', 'failed') ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            empty['last_completed_wake_failed'] = completed_row['wake_failed'] if completed_row else None
+
+            def_row = connection.execute(
+                '''SELECT COALESCE(SUM(checks_deferred), 0) AS total,
+                          SUM(CASE WHEN checks_deferred > 0 THEN 1 ELSE 0 END) AS ticks
+                   FROM check_ticks
+                   WHERE started_at >= ? AND checks_deferred IS NOT NULL''',
+                (cutoff_24h,),
+            ).fetchone()
+            empty['checks_deferred_24h'] = {'total': int(def_row['total'] or 0), 'ticks': int(def_row['ticks'] or 0)}
+
+        if _table_exists(connection, 'check_tasks'):
+            empty['unnotified_tasks'] = connection.execute(
+                'SELECT COUNT(*) FROM check_tasks WHERE needs_wake=1'
+            ).fetchone()[0]
+
+        if _table_exists(connection, 'check_runs'):
+            ev_row = connection.execute(
+                'SELECT COALESCE(SUM(events_deferred), 0) AS total FROM check_runs WHERE started_at >= ?',
+                (cutoff_24h,),
+            ).fetchone()
+            empty['events_deferred_24h'] = int(ev_row['total'] or 0)
+
+        if _table_exists(connection, 'checks'):
+            max_overdue = 0.0
+            max_name = None
+            for row in connection.execute(
+                'SELECT name, interval, last_started, last_actual_started_at, last_outcome FROM checks WHERE enabled=1'
+            ):
+                if row['last_started'] is None or row['last_actual_started_at'] is None or row['last_outcome'] is None:
+                    continue
+                base_iso = row['last_started'] if row['last_outcome'] in CHECK_SUCCESS_OUTCOMES else row['last_actual_started_at']
+                overdue = (now_ts - _parse_iso_ts(base_iso)) - float(row['interval'])
+                if overdue > max_overdue:
+                    max_overdue = overdue
+                    max_name = row['name']
+            empty['max_overdue_sec'] = round(max_overdue, 3)
+            empty['max_overdue_check'] = max_name
+
+    return empty
+
+
+def format_check_status(data):
+    lines = [
+        f"last_ok_tick_at: {data['last_ok_tick_at'] or 'none'}",
+        f"unnotified_tasks: {data['unnotified_tasks']}",
+        f"last_completed_wake_failed: {data['last_completed_wake_failed'] if data['last_completed_wake_failed'] is not None else 'none'}",
+        f"checks_deferred_24h: total={data['checks_deferred_24h']['total']} ticks={data['checks_deferred_24h']['ticks']}",
+        f"events_deferred_24h: {data['events_deferred_24h']}",
+        f"max_overdue: {data['max_overdue_sec']}s" + (f" ({data['max_overdue_check']})" if data['max_overdue_check'] else ''),
+    ]
+    if data['running_leftover_count'] > 0:
+        lines.append(f"WARNING: running 残留 tick が {data['running_leftover_count']} 件あります (異常終了の痕跡)")
+    if data.get('running_in_progress_count', 0) > 0:
+        lines.append('running_in_progress: 1 (最新 tick が status=running です。実行中の可能性があります)')
+    if data['recent_ticks']:
+        lines.append('recent_ticks:')
+        for tick in data['recent_ticks']:
+            deferred = '-' if tick['checks_deferred'] is None else str(tick['checks_deferred'])
+            lines.append(
+                f"  #{tick['id']} {tick['started_at']} status={tick['status']} "
+                f"wake_failed={tick['wake_failed']} unnotified={tick['unnotified_tasks']} deferred={deferred}"
+            )
+    else:
+        lines.append('recent_ticks: (none)')
+    return '\n'.join(lines)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local decision inbox')
     parser.add_argument('--db', type=Path, default=default_db())
@@ -2036,6 +3737,17 @@ def main(argv=None):
             sub.add_argument('--state', required=True, help=' / '.join(MSG_STATES))
             sub.add_argument('--wait', help='state が held のときだけ。decision=ID / pr=URL / msg=名前')
             sub.add_argument('--req', help='msg の req: ヘッダの依頼 id (task id)')
+    check = commands.add_parser('check', help='定期監視 check の実行と状態確認を行う')
+    check_commands = check.add_subparsers(dest='check_command', required=True)
+    check_tick = check_commands.add_parser('tick', help='due な check を実行し、タスク登録と run-inbox 通知を行う')
+    check_tick.add_argument('--config', type=Path, default=None, help='checks.toml の絶対パス (既定は環境変数 CUE_CHECKS_CONFIG)')
+    check_tick.add_argument('--run-inbox', dest='run_inbox', default=None, help='run-inbox.sh のパス (既定は CUE_RUN_INBOX_BIN)')
+    check_tick.add_argument('--run', dest='wake_run', default=None, help='通知先の run id (省略時は run-inbox.sh active で解決)')
+    check_list = check_commands.add_parser('list', help='checks テーブルの鏡一覧を表示する')
+    check_list.add_argument('--json', action='store_true', help='JSON で出力する')
+    check_status = check_commands.add_parser('status', help='tick 履歴・未通知タスク・遅延などの稼働状態を表示する')
+    check_status.add_argument('--limit', type=int, default=20, help='直近 tick 表示件数 (既定 20)')
+    check_status.add_argument('--json', action='store_true', help='JSON で出力する')
     for sub in (complete, report, renew):
         group = sub.add_mutually_exclusive_group(required=True)
         group.add_argument('--token')
@@ -2046,6 +3758,26 @@ def main(argv=None):
             # Store を開かない。対応版かを確かめるだけの呼び出しで DB を作ったり移行したりしないため
             hook = pre_add_hook()
             print(json.dumps({'pre_add': hook and str(hook)}, ensure_ascii=False))
+            return 0
+        if args.command == 'check':
+            # Store を先に開かない。skip 経路と読み取り専用経路で WAL 切替・DDL を起こさないため
+            if args.check_command == 'tick':
+                config = args.config or (Path(os.environ['CUE_CHECKS_CONFIG']) if os.environ.get('CUE_CHECKS_CONFIG') else None)
+                result, exit_code = run_check_tick(
+                    args.db, config,
+                    run_inbox_bin=args.run_inbox,
+                    wake_run_id=args.wake_run,
+                )
+                print(json.dumps(result, ensure_ascii=False))
+                return exit_code
+            if args.check_command == 'list':
+                data = check_list_data(args.db)
+                print(json.dumps(data, ensure_ascii=False) if args.json else format_check_list(data))
+                return 0
+            if args.limit < 1:
+                raise AppError(400, '--limit は 1 以上の整数を指定してください')
+            data = check_status_data(args.db, limit=args.limit)
+            print(json.dumps(data, ensure_ascii=False) if args.json else format_check_status(data))
             return 0
         if args.command == 'tui':
             web_url = tui_web_url(args.web_url)
