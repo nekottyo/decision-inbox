@@ -577,7 +577,9 @@ theorem mirror_wait_bounded_by_endWorkDeadline (now endWorkDeadline configuredBu
   unfold cappedMirrorBusy
   omega
 
-/-- 残り作業時間が無い (endWorkDeadline ≤ now) とき、mirror の残り予算は 0 で書き込みを開始しない。 -/
+/-- 残り作業時間が無い (endWorkDeadline ≤ now) とき、mirror の残り予算 (`cappedMirrorBusy`) は 0 になる。
+この定理が示すのは残り予算が 0 になることだけであり、mirror 書き込みを実際に skip するのは
+実装 `run_check_tick` (`mirror_rem <= 0` のとき `sync_checks_mirror` を呼ばず `aborted` へ進む) である。 -/
 theorem mirror_budget_zero_when_exhausted (now endWorkDeadline configuredBusy : Nat)
     (hPast : endWorkDeadline ≤ now) :
     cappedMirrorBusy now endWorkDeadline configuredBusy = 0 := by

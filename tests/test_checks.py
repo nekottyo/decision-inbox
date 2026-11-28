@@ -3847,14 +3847,20 @@ sys.exit(2)
                 t.join(timeout=3.0)
 
         self.addCleanup(_cleanup_holder)
+        admission_reached_c = [False]
         anchor_c = [None]
         seen_busy_c = []
+        mirror_elapsed_c = []
 
         def mono_c():
-            if anchor_c[0] is None:
-                return 0.0
             # tick_budget=2.5, finalize_reserve=0.5 -> end_work_deadline=2.0。
-            # 検証終了時に 1.92 (残り 80ms) から実時間で進める
+            # admission (mirror_rem の確認) が終わるまでは 1.92 (残り 80ms) に固定し、
+            # sync に入った時点から実時間で進める。検証や writer 取得のスケジューリング
+            # 遅延が mirror の残量判定に影響しないようにする。
+            if not admission_reached_c[0]:
+                return 0.0
+            if anchor_c[0] is None:
+                return 1.92
             return 1.92 + (time.monotonic() - anchor_c[0])
 
         def validate_then_lock(*args, **kwargs):
@@ -3863,18 +3869,20 @@ sys.exit(2)
             holder.append(t)
             t.start()
             self.assertTrue(lock_acq.wait(timeout=3.0))
-            anchor_c[0] = time.monotonic()
+            admission_reached_c[0] = True
             return res
 
         def sync_then_release_for_finalize(*args, **kwargs):
             seen_busy_c.append(kwargs.get('busy_timeout_ms'))
+            started_sync = time.monotonic()
+            anchor_c[0] = started_sync
             try:
                 return orig_sync(*args, **kwargs)
             finally:
+                mirror_elapsed_c.append(time.monotonic() - started_sync)
                 _cleanup_holder()
 
         err_c = io.StringIO()
-        started_c = time.monotonic()
         try:
             with mock.patch('app.load_and_validate_checks_config', side_effect=validate_then_lock), \
                     mock.patch('app.sync_checks_mirror', side_effect=sync_then_release_for_finalize), \
@@ -3890,12 +3898,15 @@ sys.exit(2)
                 )
         finally:
             _cleanup_holder()
-        elapsed_c = time.monotonic() - started_c
         self.assertEqual((rc_c, body_c['status']), (1, 'failed'))
         self.assertIsNone(body_c['checks_deferred'])
         self.assertEqual(len(seen_busy_c), 1)
         self.assertLessEqual(seen_busy_c[0], 80)
-        self.assertLess(elapsed_c, 1.0, 'mirror wait must not spend full 5000ms busy timeout')
+        self.assertEqual(len(mirror_elapsed_c), 1)
+        self.assertLess(
+            mirror_elapsed_c[0], 1.0,
+            'mirror wait must not spend full 5000ms busy timeout',
+        )
         self.assertEqual(self.query_all("SELECT * FROM check_ticks WHERE status='running'"), [])
         tick_c = self.query_one('SELECT status, finished_at FROM check_ticks WHERE id=?', (body_c['tick_id'],))
         self.assertEqual(tick_c['status'], 'failed')
