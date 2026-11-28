@@ -1,5 +1,12 @@
 # Changelog
 
+## [v0.0.4](https://github.com/nekottyo-orgs/decision-inbox/compare/v0.0.3...v0.0.4) - 2026-11-28
+
+- chore: Dependabot cooldown 7d と workflow lockfile への統一 by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/63
+- chore(deps): bump actions/create-github-app-token from 3.3.0 to 3.4.0 by @dependabot[bot] in https://github.com/nekottyo-orgs/decision-inbox/pull/66
+- chore(deps): bump @stylexjs/stylex from 0.19.1 to 0.19.2 in /frontend by @dependabot[bot] in https://github.com/nekottyo-orgs/decision-inbox/pull/67
+- check runner (tick) の実装 by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/61
+
 ## [v0.0.3](https://github.com/nekottyo-orgs/decision-inbox/compare/v0.0.2...v0.0.3) - 2026-11-28
 
 - feat: Board の依頼 thread に task の中身と msg の tag を出す by @nekottyo in https://github.com/nekottyo-orgs/decision-inbox/pull/56
