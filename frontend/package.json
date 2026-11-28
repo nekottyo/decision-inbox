@@ -6,7 +6,7 @@
     "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --entry-names=app --outdir=dist/assets && cp index.html dist/index.html"
   },
   "dependencies": {
-    "@astryxdesign/core": "0.7.5",
+    "@astryxdesign/core": "0.7.17",
     "@astryxdesign/theme-neutral": "0.7.5",
     "@stylexjs/stylex": "0.19.2",
     "react": "19.3.1",
