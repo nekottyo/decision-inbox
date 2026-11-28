@@ -7,7 +7,7 @@
   },
   "dependencies": {
     "@astryxdesign/core": "0.7.5",
-    "@astryxdesign/theme-neutral": "0.7.5",
+    "@astryxdesign/theme-neutral": "0.7.17",
     "@stylexjs/stylex": "0.19.2",
     "react": "19.3.1",
     "react-dom": "19.3.1"
